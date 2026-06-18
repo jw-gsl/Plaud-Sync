@@ -13,7 +13,8 @@ After building once, the app in `dist/` is **self-contained** — users do not n
 1. Build the installer (one time, on a Mac with dev tools):
 
    ```bash
-   cd hidock-tools/plaud-sync
+   git clone https://github.com/jw-gsl/Plaud-Sync.git
+   cd Plaud-Sync
    ./build-installer.sh
    ```
 
@@ -30,15 +31,17 @@ After building once, the app in `dist/` is **self-contained** — users do not n
 ### Windows
 
 ```bash
-cd hidock-tools/plaud-sync
+git clone https://github.com/jw-gsl/Plaud-Sync.git
+cd Plaud-Sync
 ./build-installer.sh
 ```
 
 Then run the `.msi` from `dist/`.
 
-### CI builds
+### CI builds & releases
 
-Pushing changes under `plaud-sync/` triggers a GitHub Actions workflow that uploads macOS and Windows installers as downloadable artifacts.
+- **`Build Plaud Sync`** runs on every push to `main` / PR — it type-checks, runs the Rust tests, and uploads unsigned macOS + Windows installers as downloadable artifacts.
+- **`Release Plaud Sync`** (manual, `workflow_dispatch`) builds **signed + notarized** bundles and publishes them to the rolling `plaud-sync-latest` release the in-app updater polls. It requires the signing secrets — see [`docs/GUIDE-plaud-sync-updater-signing.md`](docs/GUIDE-plaud-sync-updater-signing.md).
 
 ---
 
@@ -65,7 +68,6 @@ Only needed if you are **building** the app, not running the finished installer.
 ### Build self-contained installer
 
 ```bash
-cd hidock-tools/plaud-sync
 ./build-installer.sh
 # or: npm run build:installer
 ```
