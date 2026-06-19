@@ -54,10 +54,29 @@ def main() -> int:
         print(f"[sign] ERROR: SIGN_ENABLED=true but missing {', '.join(missing)}", file=sys.stderr)
         return 1
 
-    # Prefer an explicit jar (JSIGN_JAR) run via `java -jar` — deterministic in
-    # CI; fall back to a `jsign` command on PATH for local use.
+    # Diagnostics: Tauri swallows the sign command's stderr, so also append a
+    # full (secret-redacted) record to ESIGNER_DEBUG_LOG, which the workflow
+    # prints in an always() step.
+    debug_log = os.environ.get("ESIGNER_DEBUG_LOG", "").strip()
+
+    def dlog(msg: str) -> None:
+        print(msg)  # to stdout so Tauri surfaces it too
+        if debug_log:
+            try:
+                with open(debug_log, "a", encoding="utf-8") as fh:
+                    fh.write(msg + "\n")
+            except OSError:
+                pass
+
+    # Resolve a concrete java binary (don't depend on PATH inside the subprocess).
     jsign_jar = os.environ.get("JSIGN_JAR", "").strip()
-    base = ["java", "-jar", jsign_jar] if jsign_jar else ["jsign"]
+    java_exe = "java"
+    jh = os.environ.get("JAVA_HOME", "").strip()
+    if jh:
+        cand = os.path.join(jh, "bin", "java.exe")
+        if os.path.exists(cand):
+            java_exe = cand
+    base = [java_exe, "-jar", jsign_jar] if jsign_jar else ["jsign"]
     cmd = base + [
         "--storetype", "ESIGNER",
         "--storepass", f"{user}|{pwd}",
@@ -68,31 +87,32 @@ def main() -> int:
         cmd += ["--alias", cred]
     cmd.append(path)
 
-    print(f"[sign] signing '{name}' via SSL.com eSigner …")  # never prints the secrets
+    # Redacted command for the log (never logs user/pass/totp/cred).
+    redacted = [java_exe, "-jar", jsign_jar] if jsign_jar else ["jsign"]
+    redacted += ["--storetype", "ESIGNER", "--storepass", "<user>|<pass>", "--keypass", "<totp>", "--tsaurl", "http://ts.ssl.com"]
+    if cred:
+        redacted += ["--alias", "<credential_id>"]
+    redacted += [path]
+
+    dlog(f"[sign] signing '{name}' via SSL.com eSigner …")
+    dlog(f"[sign] cmd: {' '.join(redacted)}")
     try:
         result = subprocess.run(cmd, capture_output=True, text=True)
-    except FileNotFoundError as e:
-        print(
-            f"[sign] ERROR: could not launch the signer ({e}). "
-            f"JSIGN_JAR={jsign_jar or '(unset)'} — is Java installed and the jar present?",
-            file=sys.stderr,
-        )
+    except Exception as e:  # FileNotFoundError (java/jar missing), etc.
+        dlog(f"[sign] ERROR: could not launch the signer: {e!r} (JSIGN_JAR={jsign_jar or '(unset)'}, JAVA_HOME={jh or '(unset)'})")
         return 1
-    # Surface jsign's own output (no secrets are echoed by jsign).
+
+    dlog(f"[sign] jsign exit={result.returncode}")
     if result.stdout:
-        sys.stdout.write(result.stdout)
+        dlog("[sign] jsign stdout:\n" + result.stdout.strip())
     if result.stderr:
-        sys.stderr.write(result.stderr)
+        dlog("[sign] jsign stderr:\n" + result.stderr.strip())
     if result.returncode != 0:
         blob = f"{result.stdout}\n{result.stderr}".lower()
         if any(w in blob for w in ("quota", "limit", "insufficient", "exceeded", "balance")):
-            print(
-                "[sign] ⚠️  jsign failed in a way that looks like the eSigner signing "
-                "allowance is exhausted. Check remaining signings in your SSL.com "
-                "eSigner dashboard (see docs/GUIDE-plaud-sync-updater-signing.md).",
-                file=sys.stderr,
-            )
-        print(f"[sign] ERROR: jsign failed for '{name}' (exit {result.returncode})", file=sys.stderr)
+            dlog("[sign] ⚠️  Looks like the eSigner signing allowance may be exhausted — "
+                 "check your SSL.com eSigner dashboard.")
+        dlog(f"[sign] ERROR: signing failed for '{name}' (exit {result.returncode})")
         return result.returncode
 
     print(f"[sign] signed '{name}' ✓")

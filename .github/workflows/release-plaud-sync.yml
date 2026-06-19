@@ -150,6 +150,7 @@ jobs:
           ES_CREDENTIAL_ID: ${{ secrets.ES_CREDENTIAL_ID }}
           ES_TOTP_SECRET: ${{ secrets.ES_TOTP_SECRET }}
           ESIGNER_COUNT_FILE: ${{ runner.temp }}/esigner_signed.txt
+          ESIGNER_DEBUG_LOG: ${{ runner.temp }}/esigner_debug.log
           JSIGN_JAR: ${{ runner.temp }}/jsign.jar
         with:
           args: ${{ matrix.args }}
@@ -165,6 +166,16 @@ jobs:
       # Report how many files this release signed via eSigner, on the run's
       # summary page. The authoritative remaining balance lives in your SSL.com
       # eSigner dashboard — this just shows what this release consumed.
+      # Surfaces the real signing output (Tauri otherwise swallows the sign
+      # command's stderr). Secret-redacted by the wrapper.
+      - name: eSigner debug log
+        if: ${{ always() && matrix.os == 'windows-latest' }}
+        shell: bash
+        run: |
+          f="${{ runner.temp }}/esigner_debug.log"
+          echo "----- eSigner debug log -----"
+          [ -f "$f" ] && cat "$f" || echo "(no debug log written)"
+
       - name: eSigner usage summary
         if: ${{ always() && matrix.os == 'windows-latest' }}
         shell: bash
