@@ -81,7 +81,10 @@ def main() -> int:
         "--storetype", "ESIGNER",
         "--storepass", f"{user}|{pwd}",
         "--keypass", totp,
+        # SSL.com's TSA is RFC 3161 — without --tsmode RFC3161 jsign defaults to
+        # Authenticode mode and can't parse the response ("invalid base64").
         "--tsaurl", "http://ts.ssl.com",
+        "--tsmode", "RFC3161",
     ]
     if cred:
         cmd += ["--alias", cred]
@@ -89,7 +92,7 @@ def main() -> int:
 
     # Redacted command for the log (never logs user/pass/totp/cred).
     redacted = [java_exe, "-jar", jsign_jar] if jsign_jar else ["jsign"]
-    redacted += ["--storetype", "ESIGNER", "--storepass", "<user>|<pass>", "--keypass", "<totp>", "--tsaurl", "http://ts.ssl.com"]
+    redacted += ["--storetype", "ESIGNER", "--storepass", "<user>|<pass>", "--keypass", "<totp>", "--tsaurl", "http://ts.ssl.com", "--tsmode", "RFC3161"]
     if cred:
         redacted += ["--alias", "<credential_id>"]
     redacted += [path]
