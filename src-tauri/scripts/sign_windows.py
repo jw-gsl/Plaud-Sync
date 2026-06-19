@@ -21,6 +21,16 @@ import os
 import subprocess
 import sys
 
+# Windows console defaults to cp1252, which can't encode some characters and
+# raises UnicodeEncodeError mid-print — which would crash this wrapper *after*
+# a successful sign and make Tauri report "failed to run python". Force UTF-8
+# (and never raise on encode) so our output can't sink the build.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 
 def main() -> int:
     if len(sys.argv) < 2:
@@ -113,12 +123,12 @@ def main() -> int:
     if result.returncode != 0:
         blob = f"{result.stdout}\n{result.stderr}".lower()
         if any(w in blob for w in ("quota", "limit", "insufficient", "exceeded", "balance")):
-            dlog("[sign] ⚠️  Looks like the eSigner signing allowance may be exhausted — "
+            dlog("[sign] WARNING: looks like the eSigner signing allowance may be exhausted - "
                  "check your SSL.com eSigner dashboard.")
         dlog(f"[sign] ERROR: signing failed for '{name}' (exit {result.returncode})")
         return result.returncode
 
-    print(f"[sign] signed '{name}' ✓")
+    print(f"[sign] signed '{name}' OK")
     # Tally this signing for the workflow's per-run usage summary.
     count_file = os.environ.get("ESIGNER_COUNT_FILE")
     if count_file:
