@@ -238,9 +238,44 @@ ignores these.
 | `APPLE_API_KEY` | App Store Connect API Key ID (10 chars) |
 | `APPLE_API_KEY_BASE64` | base64 of the `.p8` key file |
 
-## Windows code signing
+## Windows code signing (SSL.com eSigner — cloud)
 
-Not set up yet. Post-2023, publicly-trusted Windows certs require the private key on
-certified hardware (HSM/token), so the old "drop a `.pfx` in CI" approach is gone. The
-CI-friendly modern option is **Azure Trusted Signing** (cloud HSM). Until then, Windows
-builds are unsigned and show a SmartScreen "unknown publisher" prompt. (To be documented.)
+Set up via **SSL.com eSigner** cloud signing (CSC protocol) — no USB token, the key
+stays in SSL.com's cloud HSM. Signing happens **inside** the Tauri bundle (so the
+updater signature matches the signed installer), via a custom `signCommand`:
+
+- `src-tauri/tauri.conf.json` → `bundle.windows.signCommand` runs
+  `python scripts/sign_windows.py %1` for each Windows binary Tauri produces.
+- `scripts/sign_windows.py` **whitelists** only the app `.exe` + the installers
+  (`-setup.exe`, `.msi`) and **skips everything else** to conserve the eSigner monthly
+  signing allowance. It's a **no-op unless `SIGN_ENABLED=true`**, so local builds and the
+  unsigned *Build Plaud Sync* workflow are unaffected — only *Release Plaud Sync* signs.
+- It signs with **Jsign** in `ESIGNER` mode (installed in CI via `choco install jsign temurin`):
+  `jsign --storetype ESIGNER --storepass "<user>|<pass>" --alias <credential_id> --keypass <totp_secret> --tsaurl http://ts.ssl.com <file>`.
+
+### Required repo secrets (Settings → Secrets → Actions)
+
+| Secret | Value |
+|---|---|
+| `ES_USERNAME` | SSL.com account username |
+| `ES_PASSWORD` | SSL.com account password |
+| `ES_CREDENTIAL_ID` | eSigner credential ID (optional — omit if you have a single cert) |
+| `ES_TOTP_SECRET` | base64 eSigner TOTP **secret** (the manual-entry string behind the enrollment QR, not a 6-digit code) |
+
+The downloaded certificate `.zip`/`.p7b` is **not** used — cloud signing happens on
+SSL.com's servers.
+
+### Signing budget (IV / Personal cert, eSigner tiers)
+
+eSigner is metered per signing. Tiers (monthly / annual): **20/240 · 100/1,200 ·
+300/3,600 · 1,000/12,000**. First 30 days are unlimited (trial); unused signings roll
+over while the subscription is active; over-limit is billed per signing.
+
+**Each release signs up to 3 files** (`.exe` + NSIS `-setup.exe` + `.msi`), so e.g. Tier 1
+(20/mo) ≈ ~6 releases/month.
+
+- **Per-release usage** is printed on the GitHub Actions run page (the *eSigner usage
+  summary* step) — "signed N file(s) this release".
+- **Authoritative remaining balance**: your **SSL.com → eSigner dashboard**.
+- If signing fails because the allowance is exhausted, the release fails and the log
+  prints a *"possible eSigner quota exhaustion"* hint.

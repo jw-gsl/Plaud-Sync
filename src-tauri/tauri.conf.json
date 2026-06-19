@@ -33,7 +33,13 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "windows": {
+      "signCommand": {
+        "cmd": "python",
+        "args": ["scripts/sign_windows.py", "%1"]
+      }
+    }
   },
   "plugins": {
     "updater": {

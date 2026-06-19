@@ -85,6 +85,12 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # Windows-only: jsign (Authenticode signer with SSL.com eSigner support)
+      # + a JRE (Temurin) it runs on. Used by the bundle signCommand.
+      - name: Install Windows signing tools (jsign + Java)
+        if: matrix.os == 'windows-latest'
+        run: choco install jsign temurin -y --no-progress
+
       - name: Install dependencies
         run: npm ci
 
@@ -118,6 +124,15 @@ jobs:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          # Windows code signing via SSL.com eSigner — read by the bundle
+          # signCommand (scripts/sign_windows.py). SIGN_ENABLED is "true" only
+          # on Windows, so macOS builds (and the unsigned Build workflow) skip.
+          SIGN_ENABLED: ${{ matrix.os == 'windows-latest' }}
+          ES_USERNAME: ${{ secrets.ES_USERNAME }}
+          ES_PASSWORD: ${{ secrets.ES_PASSWORD }}
+          ES_CREDENTIAL_ID: ${{ secrets.ES_CREDENTIAL_ID }}
+          ES_TOTP_SECRET: ${{ secrets.ES_TOTP_SECRET }}
+          ESIGNER_COUNT_FILE: ${{ runner.temp }}/esigner_signed.txt
         with:
           tagName: plaud-sync-latest
           releaseName: "Plaud Sync v__VERSION__"
@@ -127,3 +142,22 @@ jobs:
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
+
+      # Report how many files this release signed via eSigner, on the run's
+      # summary page. The authoritative remaining balance lives in your SSL.com
+      # eSigner dashboard — this just shows what this release consumed.
+      - name: eSigner usage summary
+        if: ${{ always() && matrix.os == 'windows-latest' }}
+        shell: bash
+        run: |
+          f="${{ runner.temp }}/esigner_signed.txt"
+          n=0; [ -f "$f" ] && n=$(grep -c . "$f" || true)
+          {
+            echo "### 🖋️ eSigner signing usage"
+            echo ""
+            echo "This release signed **$n file(s)** via SSL.com eSigner cloud signing."
+            echo ""
+            echo "Counts against your monthly eSigner allowance (Tier 1 = 20/mo · Tier 2 = 100 · Tier 3 = 300 · Tier 4 = 1000)."
+            echo "Authoritative remaining balance: your **SSL.com → eSigner dashboard**."
+            if [ "$n" -gt 0 ]; then echo ""; echo "Files signed this run:"; sed 's/^/- /' "$f"; fi
+          } >> "$GITHUB_STEP_SUMMARY"
