@@ -279,3 +279,42 @@ over while the subscription is active; over-limit is billed per signing.
 - **Authoritative remaining balance**: your **SSL.com → eSigner dashboard**.
 - If signing fails because the allowance is exhausted, the release fails and the log
   prints a *"possible eSigner quota exhaustion"* hint.
+
+### Checking how many signings you've used / have left
+
+- **Web (authoritative):** SSL.com account → your **order page** → *End Entity
+  Certificates* → **Show Details** → **"Signings This Month."**
+- **CI:** each release prints the count it consumed on the run's summary page.
+- **API:** SSL.com exposes an **eSigner CSC API** (Cloud Signature Consortium
+  protocol) for signing operations, but there is **no documented endpoint that
+  returns remaining quota/balance** — use the order page for that.
+
+## Troubleshooting — Windows eSigner signing (failures we actually hit)
+
+Getting the first signed Windows release green took several iterations. Each
+failure surfaced as Tauri's unhelpful generic `failed to bundle project
+"failed to run python"` (Tauri swallows the sign command's stderr). The real
+causes, in the order we hit them:
+
+1. **Whitelist missed the app exe.** The Cargo binary is `plaud-sync.exe`, not
+   `Plaud Sync.exe` (the product name). `scripts/sign_windows.py` must match the
+   real binary name or the app exe ships unsigned.
+2. **`jsign` not on PATH** in the build step (a `choco`-installed shim isn't
+   reliably on PATH for the `tauri-action` step). Fix: download the **jsign jar**
+   to a known path (`JSIGN_JAR`) and run it via **`java -jar`**, resolving java
+   from **`$JAVA_HOME/bin/java.exe`** (don't rely on PATH inside the subprocess).
+3. **No visibility.** Tauri hides the sign command's stderr, so we added an
+   `ESIGNER_DEBUG_LOG` that the wrapper writes to and an `always()` workflow step
+   that prints it. Essential for diagnosing anything here.
+4. **Timestamping failed** with `DecoderException: invalid base64`. jsign defaults
+   to **Authenticode** timestamp mode, but SSL.com's `ts.ssl.com` is **RFC 3161**.
+   Fix: `--tsmode RFC3161` (legacy RSA endpoint if needed: `http://ts.ssl.com/legacy`).
+5. **Wrapper crashed *after* a successful sign** printing a `✓` — Windows'
+   cp1252 console can't encode U+2713 → `UnicodeEncodeError` → non-zero exit →
+   Tauri reports "failed to run python". Fix: force **UTF-8** stdout/stderr
+   (`errors="replace"`) and keep wrapper output ASCII.
+
+Note: the eSigner **credentials were correct the whole time** — none of these
+were auth errors. If you ever do see an auth failure, jsign runs for several
+seconds then errors (vs. a sub-second "failed to run python", which means the
+signer never launched or the wrapper crashed).
