@@ -90,11 +90,23 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      # Windows-only: jsign (Authenticode signer with SSL.com eSigner support)
-      # + a JRE (Temurin) it runs on. Used by the bundle signCommand.
-      - name: Install Windows signing tools (jsign + Java)
+      # Windows-only: Java + the jsign jar (Authenticode signer with SSL.com
+      # eSigner support), used by the bundle signCommand. We download the jar to
+      # a known path (JSIGN_JAR) and run it via `java -jar` so it doesn't depend
+      # on PATH/shims being refreshed mid-job.
+      - name: Set up Java (for jsign)
         if: matrix.os == 'windows-latest'
-        run: choco install jsign temurin -y --no-progress
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Download jsign
+        if: matrix.os == 'windows-latest'
+        shell: bash
+        run: |
+          curl -fL -o "$RUNNER_TEMP/jsign.jar" https://github.com/ebourg/jsign/releases/download/7.4/jsign-7.4.jar
+          echo "JSIGN_JAR=$RUNNER_TEMP/jsign.jar" >> "$GITHUB_ENV"
 
       - name: Install dependencies
         run: npm ci
@@ -138,6 +150,7 @@ jobs:
           ES_CREDENTIAL_ID: ${{ secrets.ES_CREDENTIAL_ID }}
           ES_TOTP_SECRET: ${{ secrets.ES_TOTP_SECRET }}
           ESIGNER_COUNT_FILE: ${{ runner.temp }}/esigner_signed.txt
+          JSIGN_JAR: ${{ runner.temp }}/jsign.jar
         with:
           args: ${{ matrix.args }}
           tagName: plaud-sync-latest
