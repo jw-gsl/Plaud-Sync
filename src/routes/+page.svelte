@@ -13,15 +13,22 @@
     type UpdateStatus,
   } from "$lib/updater";
   import { onMount } from "svelte";
+  import { getVersion } from "@tauri-apps/api/app";
 
   let auth = $state<AuthStatus | null>(null);
   let view = $state<"sync" | "settings">("sync");
   let loading = $state(true);
+  let appVersion = $state("");
 
   let update = $state<UpdateStatus>({ kind: "idle" });
   let pendingUpdate: Update | null = null;
 
   onMount(async () => {
+    try {
+      appVersion = await getVersion();
+    } catch {
+      // ignore — version label just stays blank
+    }
     try {
       const settings = await api.getSettings();
       applyTheme(settings.theme);
@@ -97,6 +104,9 @@
         <p>Download your recordings locally</p>
       </div>
     </div>
+    {#if appVersion}
+      <span class="app-version">v{appVersion}</span>
+    {/if}
   </header>
 
   {#if update.kind === "available"}
@@ -149,6 +159,14 @@
 </div>
 
 <style>
+  .app-version {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    align-self: flex-start;
+  }
+
   .update-bar {
     display: flex;
     align-items: center;

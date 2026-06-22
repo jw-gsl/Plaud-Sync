@@ -259,11 +259,25 @@ const TOKEN_WATCHER_SCRIPT: &str = r#"
   // the webview, plus the id_token interception above. We deliberately do NOT
   // scan localStorage/responses for JWTs — web.plaud.ai stores a Frill-scoped
   // token there that the main API rejects.
+  // Code/SSO login on web.plaud.ai completes with an in-page (SPA) route
+  // change that fires no native navigation/page-load event, so the native
+  // cookie poll wouldn't know to re-read for the freshly-set session cookie.
+  // Ping the native side on every location change to trigger that read.
+  function pingRecheck() {
+    try {
+      const frame = document.createElement("iframe");
+      frame.style.display = "none";
+      frame.src = "plaudsync://recheck";
+      (document.body || document.documentElement).appendChild(frame);
+      setTimeout(function () { try { frame.remove(); } catch (_) {} }, 0);
+    } catch (_) {}
+  }
   let lastUrl = location.href;
   setInterval(function () {
     if (location.href !== lastUrl) {
       plog("location changed: " + lastUrl + " -> " + location.href);
       lastUrl = location.href;
+      pingRecheck();
     }
   }, 700);
 })();
@@ -342,8 +356,12 @@ pub async fn login_with_browser<R: Runtime>(
     .on_navigation(move |url| {
         // A real page navigation (not one of our `plaudsync://` callback/log
         // pings) can mean the session cookie just appeared — schedule one
-        // settled cookie read rather than polling continuously.
-        if url.scheme() != CALLBACK_SCHEME {
+        // settled cookie read rather than polling continuously. We also honor
+        // an explicit `plaudsync://recheck` ping: Plaud's code/SSO login
+        // finishes with an in-page SPA route change that fires no native
+        // navigation/page-load event, so the injected script pings us on every
+        // location change to trigger the cookie read.
+        if url.scheme() != CALLBACK_SCHEME || url.host_str() == Some("recheck") {
             nav_cookie_check.store(true, Ordering::Relaxed);
         }
         handle_navigation(&app_handle, &default_region, &url)
@@ -512,12 +530,27 @@ fn read_session_cookie<R: Runtime>(
     window: &tauri::WebviewWindow<R>,
     region: &str,
 ) -> Option<BrowserLogin> {
-    let url = "https://api.plaud.ai".parse().ok()?;
-    let cookies = window.cookies_for_url(url).ok()?;
+    // Read every cookie and match by name ourselves rather than using
+    // `cookies_for_url`. wry's `cookies_for_url` filters with a naive
+    // `cookie.domain() == url.domain()` string equality, so a parent-domain
+    // cookie like `.plaud.ai` never matches a subdomain host such as
+    // `api.plaud.ai` / `web.plaud.ai`. Plaud sets `pld_ut` / `pld_urt` on
+    // `.plaud.ai`, so that filter would silently drop the session cookie and
+    // sign-in would hang forever waiting for a token that's already there.
+    let cookies = window.cookies().ok()?;
 
     let mut user_token = None;
     let mut refresh_token = None;
     for cookie in &cookies {
+        // Defensive: only adopt tokens from a plaud.ai domain (the store also
+        // holds unrelated cookies, e.g. Google SSO leftovers).
+        let on_plaud = cookie
+            .domain()
+            .map(|d| d.trim_start_matches('.').ends_with("plaud.ai"))
+            .unwrap_or(false);
+        if !on_plaud {
+            continue;
+        }
         match cookie.name() {
             "pld_ut" if !cookie.value().is_empty() => user_token = Some(cookie.value().to_string()),
             "pld_urt" if !cookie.value().is_empty() => {
@@ -699,6 +732,15 @@ fn handle_navigation<R: Runtime>(app: &AppHandle<R>, default_region: &str, url: 
             } else {
                 login_log::debug(&format!("js log callback without message: {url}"));
             }
+            return false;
+        }
+
+        // SPA route-change ping (see the navigation closure): the cookie-read
+        // flag was already set there; nothing more to do here. Must be handled
+        // before `parse_callback`, which would otherwise treat it as an
+        // unexpected callback and fail the sign-in.
+        if url.host_str() == Some("recheck") {
+            login_log::debug("js recheck ping — cookie read scheduled");
             return false;
         }
 

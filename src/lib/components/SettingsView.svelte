@@ -129,6 +129,32 @@
     <div class="status success">Settings saved.</div>
   {/if}
 
+  <fieldset class="field">
+    <legend>Updates</legend>
+    <div class="toggle-row">
+      <div>
+        <strong>App updates</strong>
+        <div class="meta">
+          Plaud Sync checks for new versions on launch and installs them with your approval.
+          {#if updateStatus.kind === "available"}
+            Version {updateStatus.version} is available.
+          {:else if updateStatus.kind === "downloading"}
+            Downloading… {updateStatus.percent}%
+          {:else if updateStatus.kind === "ready"}
+            Update installed — restart to finish.
+          {:else if updateStatus.kind === "uptodate"}
+            You're on the latest version.
+          {:else if updateStatus.kind === "error"}
+            Last check failed: {updateStatus.message}
+          {/if}
+        </div>
+      </div>
+      <button class="btn btn-secondary btn-sm" onclick={onCheckUpdates} disabled={checkingUpdate}>
+        {checkingUpdate ? "Checking…" : "Check for updates"}
+      </button>
+    </div>
+  </fieldset>
+
   <div class="field">
     <label for="download-dir">Save location</label>
     <div class="folder-row">
@@ -248,32 +274,6 @@
       </button>
       <button class:active={settings.theme === "dark"} onclick={() => setTheme("dark")}>
         Dark
-      </button>
-    </div>
-  </fieldset>
-
-  <fieldset class="field">
-    <legend>Updates</legend>
-    <div class="toggle-row">
-      <div>
-        <strong>App updates</strong>
-        <div class="meta">
-          Plaud Sync checks for new versions on launch and installs them with your approval.
-          {#if updateStatus.kind === "available"}
-            Version {updateStatus.version} is available.
-          {:else if updateStatus.kind === "downloading"}
-            Downloading… {updateStatus.percent}%
-          {:else if updateStatus.kind === "ready"}
-            Update installed — restart to finish.
-          {:else if updateStatus.kind === "uptodate"}
-            You're on the latest version.
-          {:else if updateStatus.kind === "error"}
-            Last check failed: {updateStatus.message}
-          {/if}
-        </div>
-      </div>
-      <button class="btn btn-secondary btn-sm" onclick={onCheckUpdates} disabled={checkingUpdate}>
-        {checkingUpdate ? "Checking…" : "Check for updates"}
       </button>
     </div>
   </fieldset>
