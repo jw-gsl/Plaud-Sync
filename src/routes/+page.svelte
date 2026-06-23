@@ -105,11 +105,20 @@
       </div>
     </div>
     {#if appVersion}
-      <span class="app-version">v{appVersion}</span>
+      <button
+        class="app-version"
+        onclick={() => checkUpdates(true)}
+        disabled={update.kind === "checking" || update.kind === "downloading"}
+        title="Check for updates"
+      >v{appVersion}</button>
     {/if}
   </header>
 
-  {#if update.kind === "available"}
+  {#if update.kind === "checking"}
+    <div class="update-bar">
+      <span>Checking for updates…</span>
+    </div>
+  {:else if update.kind === "available"}
     <div class="update-bar">
       <span>Version {update.version} is available.</span>
       <button class="btn btn-primary btn-sm" onclick={installUpdate}>Download &amp; install</button>
@@ -165,6 +174,19 @@
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
     align-self: flex-start;
+    background: none;
+    border: none;
+    padding: 2px 6px;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+  .app-version:hover:not(:disabled) {
+    color: var(--text);
+    background: var(--surface-muted);
+  }
+  .app-version:disabled {
+    cursor: default;
+    opacity: 0.7;
   }
 
   .update-bar {
