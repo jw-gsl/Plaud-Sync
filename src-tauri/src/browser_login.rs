@@ -941,16 +941,23 @@ pub fn close_login_window<R: Runtime>(app: &AppHandle<R>) {
     }
 }
 
-/// Delete Plaud's session cookies from the shared webview cookie store so the
-/// next browser sign-in starts from a clean login form.
+/// Wipe the embedded webview's session so the next browser sign-in starts from
+/// a clean login form.
 ///
 /// `logout` otherwise only clears *our* stored token while web.plaud.ai's
-/// `pld_ut` / `pld_urt` cookies linger in the webview — the next sign-in
-/// silently re-adopts that cached session (the login window just flashes open
-/// and closes), so a signed-out user can never actually re-enter credentials.
-pub fn clear_session_cookies<R: Runtime>(app: &AppHandle<R>) {
-    // Every app webview shares the default data store, so any existing window
-    // can read/delete the shared cookies; prefer the always-present main window.
+/// session lingers in the webview — the next sign-in silently re-adopts that
+/// cached session (the login window just flashes open and closes), so a
+/// signed-out user can never actually re-enter credentials.
+///
+/// We clear the whole data store rather than deleting individual cookies:
+/// WKWebView's per-cookie `deleteCookie` only removes a cookie that fully
+/// matches the stored one (incl. the secure / httpOnly flags), but the cookie
+/// reconstructed from `cookies()` lacks those, so `pld_ut` (secure+httpOnly)
+/// is never matched and survives. `clear_all_browsing_data` removes data by
+/// type, with no per-cookie matching, so it reliably drops the session. All
+/// app webviews share the default data store, and app settings live in native
+/// storage (not webview storage), so nothing important is lost.
+pub fn clear_webview_session<R: Runtime>(app: &AppHandle<R>) {
     let Some(window) = app
         .get_webview_window("main")
         .or_else(|| app.get_webview_window(LOGIN_WINDOW_LABEL))
@@ -958,28 +965,10 @@ pub fn clear_session_cookies<R: Runtime>(app: &AppHandle<R>) {
         return;
     };
 
-    let Ok(cookies) = window.cookies() else {
-        login_log::warn("logout: could not read webview cookies to clear session");
-        return;
-    };
-
-    let mut cleared = 0;
-    for cookie in cookies {
-        let on_plaud = cookie
-            .domain()
-            .map(|d| d.trim_start_matches('.').ends_with("plaud.ai"))
-            .unwrap_or(false);
-        if !on_plaud {
-            continue;
-        }
-        match window.delete_cookie(cookie) {
-            Ok(()) => cleared += 1,
-            Err(e) => login_log::warn(&format!("logout: failed to delete a plaud cookie: {e}")),
-        }
+    match window.clear_all_browsing_data() {
+        Ok(()) => login_log::info("logout: cleared webview browsing data (cookies + storage)"),
+        Err(e) => login_log::warn(&format!("logout: failed to clear webview data: {e}")),
     }
-    login_log::info(&format!(
-        "logout: cleared {cleared} plaud session cookie(s) from webview"
-    ));
 }
 
 pub fn open_debug_log() -> Result<(), String> {

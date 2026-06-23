@@ -123,7 +123,7 @@ pub fn logout(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> 
     browser_login::close_login_window(&app);
     // Clear the webview's cached Plaud session too, otherwise the next sign-in
     // silently re-adopts it and the login window just flashes shut.
-    browser_login::clear_session_cookies(&app);
+    browser_login::clear_webview_session(&app);
     let storage = state.storage.lock().map_err(|e| e.to_string())?;
     storage.clear_auth().map_err(|e| e.to_string())
 }
