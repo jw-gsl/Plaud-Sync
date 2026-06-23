@@ -128,6 +128,33 @@ jobs:
           printf '%s' "$APPLE_API_KEY_BASE64" | base64 --decode > "$RUNNER_TEMP/asc/AuthKey.p8"
           echo "APPLE_API_KEY_PATH=$RUNNER_TEMP/asc/AuthKey.p8" >> "$GITHUB_ENV"
 
+      # Pull the notes for the version being shipped out of CHANGELOG.md so the
+      # GitHub release body reflects what actually changed (rather than a static
+      # blurb). Runs on both runners; they publish identical bodies to the
+      # shared rolling release.
+      - name: Extract release notes from CHANGELOG.md
+        id: notes
+        shell: bash
+        run: |
+          VERSION=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          echo "Resolved version: $VERSION"
+          # Extract the section for this version, then strip leading/trailing
+          # blank lines (portable awk — runs on both BSD awk on macOS and gawk).
+          NOTES=$(awk -v hdr="## [$VERSION]" '
+            index($0, hdr) == 1 { found=1; next }
+            /^## \[/ { if (found) exit }
+            found { print }
+          ' CHANGELOG.md | awk 'NF{last=NR} {line[NR]=$0} END{first=1; while(first<=last && line[first]=="") first++; for(i=first;i<=last;i++) print line[i]}')
+          if [ -z "$NOTES" ]; then
+            NOTES="See CHANGELOG.md for details."
+          fi
+          {
+            echo "body<<__NOTES_EOF__"
+            printf '%s\n\n' "$NOTES"
+            echo "New install: download the \`.dmg\` (macOS) or \`-setup.exe\` (Windows) below."
+            echo "__NOTES_EOF__"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build, sign, and publish to the updater release
         uses: tauri-apps/tauri-action@v0
         env:
@@ -156,9 +183,7 @@ jobs:
           args: ${{ matrix.args }}
           tagName: plaud-sync-latest
           releaseName: "Plaud Sync v__VERSION__"
-          releaseBody: |
-            Automatic update channel for Plaud Sync. Installed apps (v0.2.0+) update themselves from here.
-            New install: download the `.dmg` (macOS) or `-setup.exe` (Windows) below.
+          releaseBody: ${{ steps.notes.outputs.body }}
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
