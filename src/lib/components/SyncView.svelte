@@ -487,7 +487,14 @@
       <div class="progress-bar">
         <div style={`width: ${localProgress.percent}%`}></div>
       </div>
-      <p class="meta">{localProgress.stage} · {localProgress.filename}</p>
+      <div class="progress-foot">
+        <p class="meta">{localProgress.stage} · {localProgress.filename} · {localProgress.percent}%</p>
+        {#if localTranscribing}
+          <button class="btn btn-ghost btn-sm" onclick={() => void cancelTranscription()}>
+            Cancel
+          </button>
+        {/if}
+      </div>
     </div>
   {/if}
 
@@ -822,6 +829,18 @@
   }
   .local-progress {
     margin-top: 8px;
+  }
+  .progress-foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .progress-foot .meta {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .status.warn {
     background: var(--pending-bg);

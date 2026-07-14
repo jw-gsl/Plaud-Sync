@@ -357,17 +357,33 @@ pub async fn transcribe_recording(
             },
         );
     };
-    emit_progress(5, "Preparing audio…");
+    emit_progress(2, "Preparing audio…");
     let app_data_for_worker = app_data.clone();
     let audio_for_worker = audio_path.clone();
     let recording_id_for_worker = recording.id.clone();
-    emit_progress(20, "Transcribing with Parakeet…");
+    // The blocking worker reports fine-grained progress through this callback.
+    // AppHandle is Send + Sync, so it can emit events from the worker thread.
+    let app_for_worker = app.clone();
+    let recording_id_for_emit = recording.id.clone();
+    let filename_for_emit = recording.filename.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
+        let progress = |percent: u8, stage: &str| {
+            let _ = app_for_worker.emit(
+                "local-transcription-progress",
+                crate::transcription::LocalTranscriptionProgress {
+                    recording_id: recording_id_for_emit.clone(),
+                    filename: filename_for_emit.clone(),
+                    percent,
+                    stage: stage.to_string(),
+                },
+            );
+        };
         crate::transcription::transcribe_file(
             &audio_for_worker,
             &app_data_for_worker,
             &recording_id_for_worker,
             &cancelled,
+            &progress,
         )
     })
     .await

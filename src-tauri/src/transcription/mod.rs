@@ -95,6 +95,7 @@ pub fn transcribe_file(
     app_data_dir: &Path,
     recording_id: &str,
     cancelled: &AtomicBool,
+    progress: &dyn Fn(u8, &str),
 ) -> Result<LocalTranscriptResult, String> {
     let Some((encoder, decoder, joiner, tokens)) = model_store::model_paths(app_data_dir) else {
         return Err(
@@ -103,6 +104,7 @@ pub fn transcribe_file(
         );
     };
 
+    progress(4, "Decoding audio…");
     let samples = audio::decode_to_16khz_mono(audio_path)?;
     let duration = samples.len() as f32 / SAMPLE_RATE as f32;
     if cancelled.load(Ordering::Acquire) {
@@ -123,6 +125,7 @@ pub fn transcribe_file(
     let recognizer = OfflineRecognizer::create(&config)
         .ok_or_else(|| "Could not initialize the Parakeet recognizer".to_string())?;
 
+    progress(8, "Detecting speech…");
     let pipeline_paths = model_store::pipeline_model_paths(app_data_dir);
     let vad_segments = pipeline_paths
         .as_ref()
@@ -136,6 +139,17 @@ pub fn transcribe_file(
     let mut timestamps = Vec::new();
     let mut durations = Vec::new();
     let mut has_timestamps = false;
+
+    // Weight the ASR phase across 10–75% by how much audio has been decoded so
+    // far, so the bar advances steadily through a long recording instead of
+    // sitting still until the whole file is done.
+    let asr_total: usize = asr_ranges
+        .iter()
+        .map(|(start, end)| end.saturating_sub(*start))
+        .sum::<usize>()
+        .max(1);
+    let mut asr_done: usize = 0;
+    progress(10, "Transcribing with Parakeet…");
 
     for (range_start, range_end) in asr_ranges {
         let mut range_offset = range_start;
@@ -169,12 +183,16 @@ pub fn transcribe_file(
                 durations.extend(chunk_durations);
             }
             range_offset += chunk.len();
+            asr_done += chunk.len();
+            let pct = 10 + ((asr_done as f32 / asr_total as f32) * 65.0) as u8;
+            progress(pct.min(75), "Transcribing with Parakeet…");
         }
     }
 
     if cancelled.load(Ordering::Acquire) {
         return Err(CANCELLED.to_string());
     }
+    progress(78, "Identifying speakers…");
     let diarization_segments = pipeline_paths
         .as_ref()
         .and_then(|paths| detect_speakers(&samples, paths));
@@ -206,6 +224,7 @@ pub fn transcribe_file(
         return Err("Parakeet returned an empty transcript".to_string());
     }
 
+    progress(94, "Saving transcript…");
     let transcript_path = audio_path.with_extension("local.txt");
     let metadata_path = audio_path.with_extension("local.json");
     atomic_write(&transcript_path, format!("{text}\n").as_bytes())?;
