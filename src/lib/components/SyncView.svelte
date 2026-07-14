@@ -276,14 +276,17 @@
   async function transcribe(recording: Recording) {
     if (!recording.downloaded || localTranscribing) return;
     localTranscribing = recording.id;
-    localProgress = {
-      recordingId: recording.id,
-      filename: recording.filename,
-      percent: 0,
-      stage: "Starting local transcription…",
-    };
     error = "";
     try {
+      // Download the models on demand the first time — the button stays
+      // "Transcribe"; clicking it just pulls the models in first if needed.
+      await ensureModelsInstalled();
+      localProgress = {
+        recordingId: recording.id,
+        filename: recording.filename,
+        percent: 0,
+        stage: "Starting local transcription…",
+      };
       const result = await api.transcribeRecording(recording);
       status = `Local transcript saved for ${recording.filename}`;
       if (result.text) await refreshList();
@@ -302,20 +305,21 @@
 
   async function cancelTranscription() {
     try {
+      // Cancel whichever phase is active — model download or transcription.
+      if (downloadingModels) await api.cancelLocalModelDownload();
       await api.cancelLocalTranscription();
     } catch (e) {
       error = String(e);
     }
   }
 
-  // Download the local models (Parakeet + speaker diarization) so a recording
-  // can be transcribed. Used when the row's Transcribe button is clicked but the
-  // models aren't installed yet.
-  async function downloadModels() {
-    if (downloadingModels) return;
+  // Ensure the local models (Parakeet + speaker diarization) are installed,
+  // downloading whatever is missing. Throws on failure/cancel so the caller's
+  // catch handles it. Progress shows in the shared model-download bar.
+  async function ensureModelsInstalled() {
+    if (modelsInstalled) return;
     downloadingModels = true;
     modelDownloadProgress = null;
-    error = "";
     try {
       if (!modelStatus?.installed) {
         modelStatus = await api.downloadLocalModel();
@@ -324,10 +328,6 @@
       if (!pipelineStatus?.installed) {
         pipelineStatus = await api.downloadLocalPipeline();
       }
-      status = "Local models installed — you can transcribe now.";
-    } catch (e) {
-      const message = String(e);
-      if (!message.toLowerCase().includes("cancel")) error = message;
     } finally {
       downloadingModels = false;
       modelDownloadProgress = null;
@@ -373,15 +373,16 @@
     const recording = transcriptRecording;
     if (!recording || localTranscribing) return;
     localTranscribing = recording.id;
-    localProgress = {
-      recordingId: recording.id,
-      filename: recording.filename,
-      percent: 0,
-      stage: "Starting local transcription…",
-    };
     transcriptLoading = true;
     error = "";
     try {
+      await ensureModelsInstalled();
+      localProgress = {
+        recordingId: recording.id,
+        filename: recording.filename,
+        percent: 0,
+        stage: "Starting local transcription…",
+      };
       await api.transcribeRecording(recording);
       transcriptText = await api.readLocalTranscript(recording);
       status = `Local transcript refreshed for ${recording.filename}`;
@@ -546,18 +547,6 @@
               >
                 Open file
               </button>
-            {:else if !modelsInstalled}
-              <button
-                class="btn btn-ghost btn-sm transcribe-btn"
-                onclick={(event) => {
-                  event.stopPropagation();
-                  void downloadModels();
-                }}
-                disabled={downloadingModels}
-                title="Download the local transcription models, then transcribe"
-              >
-                {downloadingModels ? "Downloading models…" : "Download models"}
-              </button>
             {:else if localTranscribing === recording.id}
               <button
                 class="btn btn-ghost btn-sm transcribe-btn"
@@ -576,7 +565,7 @@
                   event.stopPropagation();
                   void transcribe(recording);
                 }}
-                disabled={localTranscribing !== null || downloadingModels}
+                disabled={localTranscribing !== null}
                 title="Transcribe with the local Parakeet model"
               >
                 Transcribe
