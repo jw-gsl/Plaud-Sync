@@ -4,44 +4,17 @@ A minimal desktop app for downloading your [Plaud](https://www.plaud.ai/) record
 
 Built with **Tauri 2** and **Svelte**. Works on **macOS** and **Windows**.
 
-## Install & Run (no dev tools needed)
+## Download & install
 
-After building once, the app in `dist/` is **self-contained** — users do not need Node.js or Rust.
+No dev tools needed — just download and run:
 
-### macOS
+1. Open the [latest release](https://github.com/jw-gsl/Plaud-Sync/releases/tag/plaud-sync-latest).
+2. Download the installer for your platform:
+   - **macOS:** `Plaud.Sync_<version>_aarch64.dmg` — open it and drag **Plaud Sync** to Applications.
+   - **Windows:** `Plaud.Sync_<version>_x64-setup.exe` — run it.
+3. Launch **Plaud Sync** and sign in.
 
-1. Build the installer (one time, on a Mac with dev tools):
-
-   ```bash
-   git clone https://github.com/jw-gsl/Plaud-Sync.git
-   cd Plaud-Sync
-   ./build-installer.sh
-   ```
-
-2. Install from `dist/`:
-   - **Option A:** Open `dist/Plaud Sync.app`
-   - **Option B:** Open the `.dmg` in `dist/` and drag the app to Applications
-
-3. If macOS blocks the first launch (unsigned build), right-click the app → **Open**, or:
-
-   ```bash
-   xattr -cr "/Applications/Plaud Sync.app"
-   ```
-
-### Windows
-
-```bash
-git clone https://github.com/jw-gsl/Plaud-Sync.git
-cd Plaud-Sync
-./build-installer.sh
-```
-
-Then run the `.msi` from `dist/`.
-
-### CI builds & releases
-
-- **`Build Plaud Sync`** runs on every push to `main` / PR — it type-checks, runs the Rust tests, and uploads unsigned macOS + Windows installers as downloadable artifacts.
-- **`Release Plaud Sync`** (manual, `workflow_dispatch`) builds **signed + notarized** bundles and publishes them to the rolling `plaud-sync-latest` release the in-app updater polls. It requires the signing secrets — see [`docs/GUIDE-plaud-sync-updater-signing.md`](docs/GUIDE-plaud-sync-updater-signing.md).
+The builds are code-signed (macOS is also notarized), so they open without security warnings. Once installed, the app **keeps itself up to date** — it checks on launch, and you can re-check anytime by clicking the version number in the top bar or via **Settings → Check for updates**.
 
 ---
 
@@ -82,6 +55,11 @@ Output lands in `dist/`:
 npm install
 npm run tauri dev
 ```
+
+### CI builds & releases
+
+- **`Build Plaud Sync`** runs on every push to `main` / PR — it type-checks, runs the Rust tests, and uploads unsigned macOS + Windows installers as downloadable artifacts.
+- **`Release Plaud Sync`** (manual, `workflow_dispatch`) builds **signed + notarized** bundles and publishes them to the rolling `plaud-sync-latest` release the in-app updater polls. It requires the signing secrets — see [`docs/GUIDE-plaud-sync-updater-signing.md`](docs/GUIDE-plaud-sync-updater-signing.md).
 
 ## First launch in the app
 
