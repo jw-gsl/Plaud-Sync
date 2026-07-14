@@ -27,6 +27,8 @@ pub struct AppSettings {
     pub theme: String,
     #[serde(default)]
     pub start_minimized: bool,
+    #[serde(default = "default_local_transcription")]
+    pub local_transcription: bool,
 }
 
 fn default_auto_sync_minutes() -> u32 {
@@ -35,6 +37,10 @@ fn default_auto_sync_minutes() -> u32 {
 
 fn default_theme() -> String {
     "system".to_string()
+}
+
+fn default_local_transcription() -> bool {
+    true
 }
 
 impl Default for AppSettings {
@@ -50,6 +56,7 @@ impl Default for AppSettings {
             auto_sync_minutes: default_auto_sync_minutes(),
             theme: default_theme(),
             start_minimized: false,
+            local_transcription: default_local_transcription(),
         }
     }
 }
@@ -61,6 +68,13 @@ struct StoredConfig {
     settings: Option<AppSettings>,
     #[serde(default)]
     display_name: Option<String>,
+    // Stored alongside the access token rather than in the keychain: the
+    // keychain ACL is bound to the app's code signature, so a refresh token
+    // written by one build couldn't be read back by a later launch (dev/ad-hoc
+    // signatures especially), which silently broke auto-refresh. The access
+    // token already lives in this file, so this is no extra exposure.
+    #[serde(default)]
+    refresh_token: Option<String>,
 }
 
 #[derive(Clone)]
@@ -84,9 +98,8 @@ impl Storage {
     }
 
     fn save(&self, config: &StoredConfig) -> Result<(), std::io::Error> {
-        let raw = serde_json::to_string_pretty(config).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-        })?;
+        let raw = serde_json::to_string_pretty(config)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         fs::write(&self.config_path, raw)
     }
 
@@ -119,18 +132,14 @@ impl Storage {
     }
 
     pub fn save_refresh_token(&self, token: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let entry = Entry::new(SERVICE_NAME, REFRESH_TOKEN_ACCOUNT)?;
-        entry.set_password(token)?;
+        let mut config = self.load();
+        config.refresh_token = Some(token.to_string());
+        self.save(&config)?;
         Ok(())
     }
 
     pub fn get_refresh_token(&self) -> Result<Option<String>, Box<dyn std::error::Error>> {
-        let entry = Entry::new(SERVICE_NAME, REFRESH_TOKEN_ACCOUNT)?;
-        match entry.get_password() {
-            Ok(token) => Ok(Some(token)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        Ok(self.load().refresh_token)
     }
 
     pub fn get_token(&self) -> Option<PlaudTokenData> {
@@ -160,10 +169,12 @@ impl Storage {
     /// Cached recordings list (metadata only; downloaded state is re-derived
     /// from disk on read). Lets the UI render instantly and survive a failed
     /// or offline refresh.
-    pub fn save_recordings_cache(&self, recordings: &[PlaudRecording]) -> Result<(), std::io::Error> {
-        let raw = serde_json::to_string(recordings).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-        })?;
+    pub fn save_recordings_cache(
+        &self,
+        recordings: &[PlaudRecording],
+    ) -> Result<(), std::io::Error> {
+        let raw = serde_json::to_string(recordings)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         fs::write(self.cache_path(), raw)
     }
 
@@ -189,11 +200,13 @@ impl Storage {
         config.credentials = None;
         config.token = None;
         config.display_name = None;
+        config.refresh_token = None;
         self.save(&config)?;
 
         if let Ok(entry) = Entry::new(SERVICE_NAME, PASSWORD_ACCOUNT) {
             let _ = entry.delete_credential();
         }
+        // Clean up any refresh token a prior build wrote to the keychain.
         if let Ok(entry) = Entry::new(SERVICE_NAME, REFRESH_TOKEN_ACCOUNT) {
             let _ = entry.delete_credential();
         }

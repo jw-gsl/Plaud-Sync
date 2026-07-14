@@ -2,7 +2,16 @@
   import { listen } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
   import { api } from "../api";
-  import type { Recording, SyncInfo, SyncProgress, SyncResult } from "../types";
+  import type {
+    LocalModelProgress,
+    LocalModelStatus,
+    LocalPipelineStatus,
+    LocalTranscriptionProgress,
+    Recording,
+    SyncInfo,
+    SyncProgress,
+    SyncResult,
+  } from "../types";
   import { formatDate, formatDuration } from "../utils";
 
   let {
@@ -28,6 +37,22 @@
   let search = $state("");
   let filter = $state<Filter>("all");
   let selected = $state<string[]>([]);
+  let localTranscribing = $state<string | null>(null);
+  let localProgress = $state<LocalTranscriptionProgress | null>(null);
+  // Local-model install state, so the row can offer to download the models when
+  // they are missing instead of failing a transcription.
+  let modelStatus = $state<LocalModelStatus | null>(null);
+  let pipelineStatus = $state<LocalPipelineStatus | null>(null);
+  let downloadingModels = $state(false);
+  let modelDownloadProgress = $state<LocalModelProgress | null>(null);
+  const modelsInstalled = $derived(!!modelStatus?.installed && !!pipelineStatus?.installed);
+  let transcriptOpen = $state(false);
+  let transcriptLoading = $state(false);
+  let transcriptText = $state("");
+  let transcriptTitle = $state("");
+  // The recording the transcript dialog is showing, so it can be retranscribed
+  // in place without closing the dialog.
+  let transcriptRecording = $state<Recording | null>(null);
 
   let lastSynced = $state<number | null>(null);
   let syncInfo = $state<SyncInfo | null>(null);
@@ -79,11 +104,19 @@
     const unlistenAutoErr = listen<string>("auto-sync-error", (e) => {
       error = `Auto-sync failed: ${e.payload}`;
     });
+    const unlistenLocal = listen<LocalTranscriptionProgress>("local-transcription-progress", (e) => {
+      localProgress = e.payload;
+    });
+    const unlistenModel = listen<LocalModelProgress>("local-model-progress", (e) => {
+      modelDownloadProgress = e.payload;
+    });
     return () => {
       clearInterval(tick);
       void unlistenProgress.then((fn) => fn());
       void unlistenAuto.then((fn) => fn());
       void unlistenAutoErr.then((fn) => fn());
+      void unlistenLocal.then((fn) => fn());
+      void unlistenModel.then((fn) => fn());
     };
   });
 
@@ -142,6 +175,20 @@
     } finally {
       loading = false;
       await refreshSyncInfo();
+      await refreshModelStatus();
+    }
+  }
+
+  async function refreshModelStatus() {
+    try {
+      modelStatus = await api.getLocalModelStatus();
+    } catch {
+      // Non-critical — the row just falls back to offering the download.
+    }
+    try {
+      pipelineStatus = await api.getLocalPipelineStatus();
+    } catch {
+      // ignore
     }
   }
 
@@ -224,6 +271,131 @@
 
   function reveal(recording: Recording) {
     if (recording.downloaded) void api.revealRecording(recording);
+  }
+
+  async function transcribe(recording: Recording) {
+    if (!recording.downloaded || localTranscribing) return;
+    localTranscribing = recording.id;
+    error = "";
+    try {
+      // Download the models on demand the first time — the button stays
+      // "Transcribe"; clicking it just pulls the models in first if needed.
+      await ensureModelsInstalled();
+      localProgress = {
+        recordingId: recording.id,
+        filename: recording.filename,
+        percent: 0,
+        stage: "Starting local transcription…",
+      };
+      const result = await api.transcribeRecording(recording);
+      status = `Local transcript saved for ${recording.filename}`;
+      if (result.text) await refreshList();
+    } catch (e) {
+      const message = String(e);
+      if (message.toLowerCase().includes("cancel")) {
+        status = `Transcription cancelled for ${recording.filename}`;
+      } else {
+        error = message;
+      }
+    } finally {
+      localTranscribing = null;
+      localProgress = null;
+    }
+  }
+
+  async function cancelTranscription() {
+    try {
+      // Cancel whichever phase is active — model download or transcription.
+      if (downloadingModels) await api.cancelLocalModelDownload();
+      await api.cancelLocalTranscription();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  // Ensure the local models (Parakeet + speaker diarization) are installed,
+  // downloading whatever is missing. Throws on failure/cancel so the caller's
+  // catch handles it. Progress shows in the shared model-download bar.
+  async function ensureModelsInstalled() {
+    if (modelsInstalled) return;
+    downloadingModels = true;
+    modelDownloadProgress = null;
+    try {
+      if (!modelStatus?.installed) {
+        modelStatus = await api.downloadLocalModel();
+        modelDownloadProgress = null;
+      }
+      if (!pipelineStatus?.installed) {
+        pipelineStatus = await api.downloadLocalPipeline();
+      }
+    } finally {
+      downloadingModels = false;
+      modelDownloadProgress = null;
+    }
+  }
+
+  async function viewTranscript(recording: Recording) {
+    transcriptOpen = true;
+    transcriptLoading = true;
+    transcriptText = "";
+    transcriptTitle = recording.filename;
+    transcriptRecording = recording;
+    error = "";
+    try {
+      transcriptText = await api.readLocalTranscript(recording);
+    } catch (e) {
+      transcriptOpen = false;
+      error = String(e);
+    } finally {
+      transcriptLoading = false;
+    }
+  }
+
+  let transcriptCopied = $state(false);
+  let copyResetTimer: ReturnType<typeof setTimeout> | null = null;
+
+  async function copyTranscript() {
+    if (!transcriptText) return;
+    try {
+      await navigator.clipboard.writeText(transcriptText);
+      transcriptCopied = true;
+      if (copyResetTimer) clearTimeout(copyResetTimer);
+      copyResetTimer = setTimeout(() => (transcriptCopied = false), 1500);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  // Re-run the local pipeline for the recording currently shown in the dialog
+  // and reload its text, without closing the dialog. Used after a model swap or
+  // to pick up tuning changes.
+  async function retranscribe() {
+    const recording = transcriptRecording;
+    if (!recording || localTranscribing) return;
+    localTranscribing = recording.id;
+    transcriptLoading = true;
+    error = "";
+    try {
+      await ensureModelsInstalled();
+      localProgress = {
+        recordingId: recording.id,
+        filename: recording.filename,
+        percent: 0,
+        stage: "Starting local transcription…",
+      };
+      await api.transcribeRecording(recording);
+      transcriptText = await api.readLocalTranscript(recording);
+      status = `Local transcript refreshed for ${recording.filename}`;
+      await refreshList();
+    } catch (e) {
+      const message = String(e);
+      // On cancel, keep the existing transcript text in the pane.
+      if (!message.toLowerCase().includes("cancel")) error = message;
+    } finally {
+      localTranscribing = null;
+      localProgress = null;
+      transcriptLoading = false;
+    }
   }
 
   const downloadLabel = $derived(
@@ -310,20 +482,103 @@
     </div>
   {/if}
 
+  {#if localProgress}
+    <div class="progress-wrap local-progress">
+      <div class="progress-bar">
+        <div style={`width: ${localProgress.percent}%`}></div>
+      </div>
+      <div class="progress-foot">
+        <p class="meta">{localProgress.stage} · {localProgress.filename} · {localProgress.percent}%</p>
+        {#if localTranscribing}
+          <button class="btn btn-ghost btn-sm" onclick={() => void cancelTranscription()}>
+            Cancel
+          </button>
+        {/if}
+      </div>
+    </div>
+  {/if}
+
+  {#if downloadingModels}
+    <div class="progress-wrap local-progress">
+      <div class="progress-bar">
+        <div
+          style={`width: ${modelDownloadProgress ? (modelDownloadProgress.downloadedTotal / Math.max(modelDownloadProgress.total, 1)) * 100 : 0}%`}
+        ></div>
+      </div>
+      <p class="meta">
+        {#if modelDownloadProgress}Downloading models · {modelDownloadProgress.file}{:else}Preparing model download…{/if}
+      </p>
+    </div>
+  {/if}
+
   {#if loading}
     <p class="meta loading-line">Loading…</p>
   {:else if visible.length}
     <div class="rec-list">
       {#each visible as recording (recording.id)}
         {#if recording.downloaded}
-          <button class="rec-row clickable" onclick={() => reveal(recording)} title="Reveal in Finder">
+          <div
+            class="rec-row clickable"
+            role="button"
+            tabindex="0"
+            onclick={() => reveal(recording)}
+            onkeydown={(event) => {
+              if (event.key === "Enter" || event.key === " ") reveal(recording);
+            }}
+            title="Reveal in Finder"
+          >
             <span class="dot done"></span>
             <span class="rec-name">{recording.filename}</span>
             <span class="rec-meta">
-              {formatDate(recording.startTime)} · {formatDuration(recording.duration)}{#if recording.isTrans} · TXT{/if}
+              {formatDate(recording.startTime)} · {formatDuration(recording.duration)}{#if recording.isTrans} · TXT{/if}{#if recording.localTranscript} · Local TXT{/if}
             </span>
-            <span class="rec-state done">Saved</span>
-          </button>
+            <span class="rec-state done">{recording.localTranscript ? "Transcribed" : "Saved"}</span>
+            {#if recording.localTranscript}
+              <button
+                class="btn btn-ghost btn-sm transcribe-btn"
+                onclick={(event) => {
+                  event.stopPropagation();
+                  void viewTranscript(recording);
+                }}
+                title="View the local transcript in Plaud Sync"
+              >
+                View transcript
+              </button>
+              <button
+                class="btn btn-ghost btn-sm transcribe-btn"
+                onclick={(event) => {
+                  event.stopPropagation();
+                  void api.openLocalTranscript(recording);
+                }}
+                title="Open the transcript file"
+              >
+                Open file
+              </button>
+            {:else if localTranscribing === recording.id}
+              <button
+                class="btn btn-ghost btn-sm transcribe-btn"
+                onclick={(event) => {
+                  event.stopPropagation();
+                  void cancelTranscription();
+                }}
+                title="Cancel this transcription"
+              >
+                Cancel
+              </button>
+            {:else}
+              <button
+                class="btn btn-ghost btn-sm transcribe-btn"
+                onclick={(event) => {
+                  event.stopPropagation();
+                  void transcribe(recording);
+                }}
+                disabled={localTranscribing !== null}
+                title="Transcribe with the local Parakeet model"
+              >
+                Transcribe
+              </button>
+            {/if}
+          </div>
         {:else}
           <div class="rec-row" title="Not downloaded yet">
             {#if showChecks}
@@ -355,6 +610,83 @@
     <p class="meta loading-line">{status}</p>
   {/if}
 </div>
+
+{#if transcriptOpen}
+  <div class="transcript-backdrop" role="presentation" onclick={() => (transcriptOpen = false)}>
+    <div
+      class="transcript-dialog"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Transcript"
+      tabindex="-1"
+      onclick={(event) => event.stopPropagation()}
+      onkeydown={(event) => {
+        if (event.key === "Escape") transcriptOpen = false;
+      }}
+    >
+      <div class="transcript-header">
+        <div>
+          <h3>{transcriptTitle}</h3>
+          <p class="meta">Local transcript · selectable text</p>
+        </div>
+        <div class="transcript-actions">
+          {#if localTranscribing === transcriptRecording?.id}
+            <button
+              class="btn btn-secondary btn-sm"
+              onclick={() => void cancelTranscription()}
+              title="Cancel this transcription"
+            >
+              Cancel
+            </button>
+          {:else}
+            <button
+              class="btn btn-secondary btn-sm"
+              onclick={() => void retranscribe()}
+              disabled={localTranscribing !== null}
+              title="Run the local transcription pipeline again and replace this transcript"
+            >
+              Retranscribe
+            </button>
+          {/if}
+          <button
+            class="btn btn-ghost btn-sm"
+            onclick={() => void copyTranscript()}
+            disabled={!transcriptText || transcriptLoading}
+            title="Copy the whole transcript to the clipboard"
+          >
+            {transcriptCopied ? "Copied!" : "Copy all"}
+          </button>
+          <button
+            class="btn btn-ghost btn-sm"
+            onclick={() => transcriptRecording && void api.openLocalTranscript(transcriptRecording)}
+            title="Open the transcript file"
+          >
+            Open file
+          </button>
+          <button
+            class="btn btn-ghost btn-sm"
+            onclick={() => transcriptRecording && void api.revealRecording(transcriptRecording)}
+            title="Reveal the recording and transcript in Finder"
+          >
+            Open folder
+          </button>
+          <button class="btn btn-ghost btn-sm" onclick={() => (transcriptOpen = false)}>Close</button>
+        </div>
+      </div>
+      {#if transcriptLoading}
+        {#if localTranscribing === transcriptRecording?.id}
+          <p class="meta loading-line">
+            {localProgress?.stage ?? "Transcribing…"}{#if localProgress} · {localProgress.percent}%{/if}
+          </p>
+        {:else}
+          <p class="meta loading-line">Loading transcript…</p>
+        {/if}
+      {:else}
+        <pre class="transcript-view">{transcriptText}</pre>
+      {/if}
+    </div>
+  </div>
+{/if}
 
 <style>
   .header-row {
@@ -447,6 +779,10 @@
   .rec-row.clickable:hover {
     background: var(--surface-muted);
   }
+  .rec-row.clickable:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: -2px;
+  }
   .dot {
     width: 7px;
     height: 7px;
@@ -487,9 +823,81 @@
   .rec-state.new {
     color: var(--primary);
   }
+  .transcribe-btn {
+    flex: none;
+    white-space: nowrap;
+  }
+  .local-progress {
+    margin-top: 8px;
+  }
+  .progress-foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .progress-foot .meta {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .status.warn {
     background: var(--pending-bg);
     color: var(--pending-text);
+  }
+  .transcript-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 20;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+    background: rgba(4, 8, 18, 0.62);
+  }
+  .transcript-dialog {
+    width: min(1080px, 100%);
+    max-height: min(760px, 90vh);
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 18px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--surface);
+    box-shadow: 0 18px 60px rgba(0, 0, 0, 0.35);
+  }
+  .transcript-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .transcript-header h3 {
+    margin: 0 0 2px;
+    font-size: 1rem;
+  }
+  .transcript-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: none;
+  }
+  .transcript-view {
+    flex: 1;
+    min-height: 220px;
+    max-height: 68vh;
+    overflow: auto;
+    margin: 0;
+    padding: 16px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface-muted);
+    color: var(--text);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    user-select: text;
+    font: 0.86rem/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
   }
   @media (max-width: 640px) {
     .rec-meta {

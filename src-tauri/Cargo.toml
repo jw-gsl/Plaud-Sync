@@ -1,6 +1,6 @@
 [package]
 name = "plaud-sync"
-version = "0.3.4"
+version = "0.4.0"
 description = "Download Plaud recordings locally"
 authors = ["James Whiting"]
 edition = "2021"
@@ -21,13 +21,20 @@ tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
 tokio = { version = "1", features = ["full"] }
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
 keyring = "3"
 dirs = "6"
 open = "5"
+futures-util = "0.3"
+sha2 = "0.10"
+bzip2 = "0.4"
+tar = "0.4"
+sherpa-onnx = { version = "1.13.4", default-features = false, features = ["static"] }
+symphonia = { version = "0.6", default-features = false, features = ["all-codecs", "all-formats"] }
+symphonia-adapter-libopus = "0.3"
 
 # macOS-only: close the orphaned OAuth provider popup (e.g. Google's account
 # chooser) that WebKit won't close via JavaScript. Raw AppKit window sweep.

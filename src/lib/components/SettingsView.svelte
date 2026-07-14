@@ -1,6 +1,8 @@
 <script lang="ts">
+  import { listen } from "@tauri-apps/api/event";
+  import { onMount } from "svelte";
   import { api } from "../api";
-  import type { AppSettings } from "../types";
+  import type { AppSettings, LocalModelProgress, LocalModelStatus, LocalPipelineStatus } from "../types";
   import type { UpdateStatus } from "../updater";
   import { applyTheme, type Theme } from "../utils";
 
@@ -29,8 +31,22 @@
     autoSyncMinutes: 15,
     theme: "system",
     startMinimized: false,
+    localTranscription: true,
   });
   let autostart = $state(false);
+  let modelStatus = $state<LocalModelStatus | null>(null);
+  let pipelineStatus = $state<LocalPipelineStatus | null>(null);
+  let modelProgress = $state<LocalModelProgress | null>(null);
+  // True while the combined model download is running (drives the "Downloading"
+  // state). `busy` is any model operation (download or delete) — it disables the
+  // buttons.
+  let downloading = $state(false);
+  let busy = $state(false);
+
+  // Local transcription is a single feature: Parakeet transcription plus speaker
+  // labels. Both model sets install together, so the UI treats them as one.
+  const modelsInstalled = $derived(!!modelStatus?.installed && !!pipelineStatus?.installed);
+  const combinedSizeMb = $derived((modelStatus?.sizeMb ?? 670) + (pipelineStatus?.sizeMb ?? 104));
 
   function setTheme(theme: Theme) {
     settings.theme = theme;
@@ -82,6 +98,16 @@
     settings = await api.getSettings();
     await refreshExample(settings);
     try {
+      modelStatus = await api.getLocalModelStatus();
+    } catch {
+      // The model status is non-critical to the rest of Settings.
+    }
+    try {
+      pipelineStatus = await api.getLocalPipelineStatus();
+    } catch {
+      // Optional speech-processing models are non-critical to Settings.
+    }
+    try {
       autostart = await api.getAutostart();
     } catch {
       // ignore
@@ -110,6 +136,69 @@
       saving = false;
     }
   }
+
+  // Download the Parakeet transcription model and the speaker-diarization models
+  // together — local transcription is one feature, not two optional pieces. Only
+  // the pieces that aren't already installed are fetched.
+  async function downloadModels() {
+    busy = true;
+    downloading = true;
+    modelProgress = null;
+    error = "";
+    try {
+      if (!modelStatus?.installed) {
+        modelStatus = await api.downloadLocalModel();
+        modelProgress = null;
+      }
+      if (!pipelineStatus?.installed) {
+        pipelineStatus = await api.downloadLocalPipeline();
+      }
+    } catch (e) {
+      const message = String(e);
+      if (!message.toLowerCase().includes("cancel")) error = message;
+    } finally {
+      downloading = false;
+      modelProgress = null;
+      busy = false;
+    }
+  }
+
+  async function deleteModels() {
+    busy = true;
+    error = "";
+    try {
+      await api.deleteLocalPipeline();
+      await api.deleteLocalModel();
+      pipelineStatus = await api.getLocalPipelineStatus();
+      modelStatus = await api.getLocalModelStatus();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function cancelModelDownload() {
+    try {
+      await api.cancelLocalModelDownload();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  function formatBytes(bytes: number): string {
+    if (bytes < 1_000_000) return `${Math.round(bytes / 1_000)} KB`;
+    return `${(bytes / 1_000_000).toFixed(bytes >= 1_000_000_000 ? 1 : 0)} MB`;
+  }
+
+  onMount(() => {
+    const unlisten = listen<LocalModelProgress>("local-model-progress", (event) => {
+      modelProgress = event.payload;
+    });
+    return () => {
+      void unlisten.then((dispose) => dispose());
+    };
+  });
 
   load();
 </script>
@@ -163,6 +252,55 @@
       <button class="btn btn-ghost" onclick={() => api.openDownloadFolder()}>Open</button>
     </div>
   </div>
+
+  <fieldset class="field model-field">
+    <legend>Local transcription</legend>
+    <div class="toggle-row">
+      <div>
+        <strong>Enable local transcription</strong>
+        <div class="meta">
+          Transcribe downloaded recordings on this computer with Parakeet v3 and label who is
+          speaking (Speaker 1, Speaker 2) using on-device voice-activity detection and speaker
+          diarization. Audio stays local and it works on macOS and Windows. The models total about
+          {combinedSizeMb} MB; their revisions are pinned and change only through a Plaud Sync
+          update.
+        </div>
+      </div>
+      <input type="checkbox" bind:checked={settings.localTranscription} />
+    </div>
+    <div class="model-row">
+      <div class="model-state">
+        {#if downloading}
+          <span class="status-pill downloading">Downloading</span>
+          <span class="meta">{#if modelProgress}{modelProgress.file} · {formatBytes(modelProgress.downloadedTotal)} / {formatBytes(modelProgress.total)}{:else}Preparing download…{/if}</span>
+        {:else if modelsInstalled}
+          <span class="status-pill installed">Installed</span>
+          <span class="meta">
+            Ready for local transcription with speaker labels · revision {modelStatus?.revision.slice(0, 8)}
+          </span>
+        {:else}
+          <span class="status-pill">Not installed</span>
+          <span class="meta">Download the models once to enable local transcription.</span>
+        {/if}
+      </div>
+      <div class="model-actions">
+        {#if downloading}
+          <button class="btn btn-ghost btn-sm" onclick={cancelModelDownload}>Cancel</button>
+        {:else if modelsInstalled}
+          <button class="btn btn-ghost btn-sm" onclick={deleteModels} disabled={busy}>Remove models</button>
+        {:else}
+          <button class="btn btn-primary btn-sm" onclick={downloadModels} disabled={busy}>
+            Download models
+          </button>
+        {/if}
+      </div>
+    </div>
+    {#if downloading && modelProgress}
+      <div class="progress-wrap">
+        <div class="progress-bar"><div style={`width: ${(modelProgress.downloadedTotal / Math.max(modelProgress.total, 1)) * 100}%`}></div></div>
+      </div>
+    {/if}
+  </fieldset>
 
   <div class="settings-grid">
     <div class="col">
@@ -358,4 +496,41 @@
     color: var(--text-muted);
     font-size: 0.85rem;
   }
+
+  .model-field {
+    margin-top: 4px;
+  }
+
+  .model-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    margin-top: 10px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    background: var(--surface-muted);
+  }
+
+  .model-state {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .status-pill {
+    font-size: 0.7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    white-space: nowrap;
+  }
+
+  .status-pill.installed { color: var(--success); }
+  .status-pill.downloading { color: var(--primary); }
+
+  .model-actions { flex: none; }
+
+  .progress-wrap { margin-top: 10px; }
 </style>

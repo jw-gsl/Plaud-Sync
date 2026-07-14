@@ -55,6 +55,26 @@ impl PlaudAuth {
         Err("Not logged in. Please sign in first.".into())
     }
 
+    /// Force a token renewal regardless of the stored token's `exp`. Used to
+    /// recover from a 401 on a token we believed was still valid (server-side
+    /// revocation, or our 24h estimate drifting against the server's clock).
+    /// Unlike `get_token`, this never falls back to the stale token — if it
+    /// can't renew, the caller should surface a re-login prompt.
+    pub async fn force_refresh(&self) -> Result<String, String> {
+        if matches!(self.storage.get_password(), Ok(Some(_))) {
+            crate::login_log::info("401 recovery: re-login with stored password");
+            return self
+                .login_with_stored_credentials()
+                .await
+                .map(|t| t.access_token);
+        }
+        if matches!(self.storage.get_refresh_token(), Ok(Some(_))) {
+            crate::login_log::info("401 recovery: exchanging pld_urt refresh token");
+            return self.refresh_with_user_token().await.map(|t| t.access_token);
+        }
+        Err("Session expired and no refresh token is stored — please sign in again.".into())
+    }
+
     /// Email/password sign-in. Tries the given region and, on a region mismatch,
     /// auto-retries against the region Plaud points to (so the user doesn't pick
     /// it). Returns the region the account actually belongs to.
@@ -140,16 +160,15 @@ impl PlaudAuth {
 
         if app_status == 0 {
             if let Some(access_token) = json["access_token"].as_str() {
-                let token =
-                    build_token_data(access_token, json["token_type"].as_str())?;
+                let token = build_token_data(access_token, json["token_type"].as_str())?;
                 self.storage.save_token(&token).map_err(|e| e.to_string())?;
                 return Ok(PwOutcome::Session(token));
             }
         }
 
         // Region mismatch: prefer the host Plaud points to, else flip us<->eu.
-        let mismatch = json["data"]["domains"]["api"].is_string()
-            || msg.to_lowercase().contains("region");
+        let mismatch =
+            json["data"]["domains"]["api"].is_string() || msg.to_lowercase().contains("region");
         if mismatch {
             let correct = json["data"]["domains"]["api"]
                 .as_str()
@@ -251,10 +270,16 @@ impl PlaudAuth {
                 .save_credentials("sso", region)
                 .map_err(|e| e.to_string())?;
             self.storage.save_token(&token).map_err(|e| e.to_string())?;
-            if let Some(refresh_token) = refresh_token {
-                self.storage
-                    .save_refresh_token(&refresh_token)
-                    .map_err(|e| e.to_string())?;
+            match refresh_token {
+                Some(ref rt) => {
+                    self.storage
+                        .save_refresh_token(rt)
+                        .map_err(|e| e.to_string())?;
+                    crate::login_log::info("captured + saved pld_urt refresh token");
+                }
+                None => crate::login_log::warn(
+                    "sso-callback returned no usable pld_urt — auto-refresh will be unavailable",
+                ),
             }
             return Ok(SsoOutcome::Session);
         }
@@ -306,10 +331,17 @@ impl PlaudAuth {
             .save_credentials("sso", region)
             .map_err(|e| e.to_string())?;
         self.storage.save_token(&token).map_err(|e| e.to_string())?;
-        if let Some(refresh_token) = refresh_token {
-            self.storage
-                .save_refresh_token(refresh_token)
-                .map_err(|e| e.to_string())?;
+        match refresh_token {
+            Some(rt) => {
+                self.storage
+                    .save_refresh_token(rt)
+                    .map_err(|e| e.to_string())?;
+                crate::login_log::info("adopted webview session + saved pld_urt refresh token");
+            }
+            None => crate::login_log::warn(
+                "adopted webview session but no pld_urt captured (likely HttpOnly) — \
+                 auto-refresh will be unavailable",
+            ),
         }
         Ok(token)
     }
@@ -333,6 +365,10 @@ impl PlaudAuth {
                 .await
                 .map_err(|e| format!("Network error: {e}"))?;
 
+        crate::login_log::info(&format!(
+            "refresh-user-token (region={region}) -> {}",
+            res.status()
+        ));
         if !res.status().is_success() {
             return Err(format!("Session refresh failed: {}", res.status()));
         }
@@ -355,9 +391,7 @@ impl PlaudAuth {
         self.storage
             .save_credentials("jwt-user", region)
             .map_err(|e| e.to_string())?;
-        self.storage
-            .save_token(&token)
-            .map_err(|e| e.to_string())?;
+        self.storage.save_token(&token).map_err(|e| e.to_string())?;
         Ok(token)
     }
 }
@@ -425,7 +459,10 @@ fn is_expiring_soon(token: &PlaudTokenData) -> bool {
     Utc::now().timestamp_millis() + TOKEN_REFRESH_BUFFER_MS > token.expires_at
 }
 
-fn build_token_data(access_token: &str, token_type: Option<&str>) -> Result<PlaudTokenData, String> {
+fn build_token_data(
+    access_token: &str,
+    token_type: Option<&str>,
+) -> Result<PlaudTokenData, String> {
     let (iat, exp) = decode_jwt_expiry(access_token)?;
     Ok(PlaudTokenData {
         access_token: access_token.to_string(),
@@ -465,15 +502,18 @@ mod tests {
     #[test]
     fn extract_set_cookie_clearing_only_is_none() {
         let mut headers = HeaderMap::new();
-        headers.append(SET_COOKIE, HeaderValue::from_static("pld_ut=\"\"; Max-Age=0"));
+        headers.append(
+            SET_COOKIE,
+            HeaderValue::from_static("pld_ut=\"\"; Max-Age=0"),
+        );
         assert_eq!(extract_set_cookie(&headers, "pld_ut"), None);
     }
 
     #[test]
     fn decode_jwt_expiry_reads_iat_and_exp() {
         // Header.{"iat":1000,"exp":2000}.sig — payload base64url of the JSON.
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(br#"{"iat":1000,"exp":2000}"#);
+        let payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"iat":1000,"exp":2000}"#);
         let jwt = format!("aaa.{payload}.bbb");
         assert_eq!(decode_jwt_expiry(&jwt), Ok((1000, 2000)));
     }

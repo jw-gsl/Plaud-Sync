@@ -1,5 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AppSettings, AuthStatus, Recording, SyncInfo, SyncResult } from "./types";
+import type {
+  AppSettings,
+  AuthStatus,
+  LocalModelStatus,
+  LocalPipelineStatus,
+  LocalTranscriptResult,
+  Recording,
+  SyncInfo,
+  SyncResult,
+} from "./types";
 
 export const api = {
   getAuthStatus: () => invoke<AuthStatus>("get_auth_status"),
@@ -28,4 +37,18 @@ export const api = {
   revealRecording: (recording: Recording) =>
     invoke<void>("reveal_recording", { recording }),
   getSyncInfo: () => invoke<SyncInfo>("get_sync_info"),
+  getLocalModelStatus: () => invoke<LocalModelStatus>("get_local_model_status"),
+  getLocalPipelineStatus: () => invoke<LocalPipelineStatus>("get_local_pipeline_status"),
+  downloadLocalModel: () => invoke<LocalModelStatus>("download_local_model"),
+  downloadLocalPipeline: () => invoke<LocalPipelineStatus>("download_local_pipeline"),
+  cancelLocalModelDownload: () => invoke<void>("cancel_local_model_download"),
+  deleteLocalModel: () => invoke<void>("delete_local_model"),
+  deleteLocalPipeline: () => invoke<void>("delete_local_pipeline"),
+  transcribeRecording: (recording: Recording) =>
+    invoke<LocalTranscriptResult>("transcribe_recording", { recording }),
+  cancelLocalTranscription: () => invoke<void>("cancel_local_transcription"),
+  openLocalTranscript: (recording: Recording) =>
+    invoke<void>("open_local_transcript", { recording }),
+  readLocalTranscript: (recording: Recording) =>
+    invoke<string>("read_local_transcript", { recording }),
 };

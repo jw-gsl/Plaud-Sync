@@ -13,6 +13,7 @@ export interface Recording {
   isTrans: boolean;
   serialNumber: string;
   downloaded: boolean;
+  localTranscript: boolean;
 }
 
 export interface AppSettings {
@@ -26,6 +27,60 @@ export interface AppSettings {
   autoSyncMinutes: number;
   theme: "system" | "light" | "dark";
   startMinimized: boolean;
+  localTranscription: boolean;
+}
+
+export interface LocalModelStatus {
+  id: string;
+  revision: string;
+  name: string;
+  description: string;
+  installed: boolean;
+  downloading: boolean;
+  downloadedBytes: number;
+  totalBytes: number;
+  sizeMb: number;
+  modelDir: string;
+}
+
+export interface LocalPipelineStatus {
+  id: string;
+  revision: string;
+  name: string;
+  description: string;
+  installed: boolean;
+  downloading: boolean;
+  downloadedBytes: number;
+  totalBytes: number;
+  sizeMb: number;
+  modelDir: string;
+}
+
+export interface LocalModelProgress {
+  file: string;
+  downloadedBytes: number;
+  totalBytes: number;
+  downloadedTotal: number;
+  total: number;
+}
+
+export interface LocalTranscriptResult {
+  text: string;
+  model: string;
+  modelRevision: string;
+  transcriptPath: string;
+  metadataPath: string;
+  audioDurationSecs: number;
+  usedVad: boolean;
+  usedDiarization: boolean;
+  speakerCount: number;
+}
+
+export interface LocalTranscriptionProgress {
+  recordingId: string;
+  filename: string;
+  percent: number;
+  stage: string;
 }
 
 export interface SyncInfo {

@@ -7,6 +7,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The app updates itself from the rolling `plaud-sync-latest` GitHub release; the
 notes for each published version are taken from this file.
 
+## [0.4.0] - 2026-07-14
+
+### Added
+- **Local transcription.** Transcribe downloaded recordings entirely on your
+  computer with Parakeet v3 — audio never leaves the machine. Works on macOS
+  and Windows.
+- **Speaker labels.** On-device voice-activity detection and speaker
+  diarization label who is speaking (Speaker 1, Speaker 2) in the transcript,
+  using an English speaker model.
+- **In-app transcript viewer** with Retranscribe, Copy all, Open file, and
+  Open folder actions.
+- Local models download on demand: clicking Transcribe fetches them the first
+  time if they aren't installed yet.
+- A live progress bar with a real percentage while transcribing, and a Cancel
+  button to stop a transcription (or the model download) at any time.
+- Settings now has a single "Local transcription" section with one button to
+  download or remove all local models.
+
 ## [0.3.4] - 2026-06-23
 
 ### Added

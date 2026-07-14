@@ -111,6 +111,8 @@ pub struct PlaudRecording {
     pub serial_number: String,
     #[serde(default)]
     pub downloaded: bool,
+    #[serde(default)]
+    pub local_transcript: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,7 +162,9 @@ mod tests {
         assert!(is_valid_plaud_api_url("https://plaud.ai"));
         assert!(!is_valid_plaud_api_url("http://api.plaud.ai")); // not https
         assert!(!is_valid_plaud_api_url("https://plaud.ai.evil.com")); // suffix trick
-        assert!(!is_valid_plaud_api_url("https://evil.com@plaud.ai.evil.com"));
+        assert!(!is_valid_plaud_api_url(
+            "https://evil.com@plaud.ai.evil.com"
+        ));
         assert!(!is_valid_plaud_api_url("not-a-url"));
     }
 
