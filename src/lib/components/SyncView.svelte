@@ -40,6 +40,9 @@
   let transcriptLoading = $state(false);
   let transcriptText = $state("");
   let transcriptTitle = $state("");
+  // The recording the transcript dialog is showing, so it can be retranscribed
+  // in place without closing the dialog.
+  let transcriptRecording = $state<Recording | null>(null);
 
   let lastSynced = $state<number | null>(null);
   let syncInfo = $state<SyncInfo | null>(null);
@@ -269,6 +272,7 @@
     transcriptLoading = true;
     transcriptText = "";
     transcriptTitle = recording.filename;
+    transcriptRecording = recording;
     error = "";
     try {
       transcriptText = await api.readLocalTranscript(recording);
@@ -276,6 +280,35 @@
       transcriptOpen = false;
       error = String(e);
     } finally {
+      transcriptLoading = false;
+    }
+  }
+
+  // Re-run the local pipeline for the recording currently shown in the dialog
+  // and reload its text, without closing the dialog. Used after a model swap or
+  // to pick up tuning changes.
+  async function retranscribe() {
+    const recording = transcriptRecording;
+    if (!recording || localTranscribing) return;
+    localTranscribing = recording.id;
+    localProgress = {
+      recordingId: recording.id,
+      filename: recording.filename,
+      percent: 0,
+      stage: "Starting local transcription…",
+    };
+    transcriptLoading = true;
+    error = "";
+    try {
+      await api.transcribeRecording(recording);
+      transcriptText = await api.readLocalTranscript(recording);
+      status = `Local transcript refreshed for ${recording.filename}`;
+      await refreshList();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      localTranscribing = null;
+      localProgress = null;
       transcriptLoading = false;
     }
   }
@@ -480,10 +513,26 @@
           <h3>{transcriptTitle}</h3>
           <p class="meta">Local transcript · selectable text</p>
         </div>
-        <button class="btn btn-ghost btn-sm" onclick={() => (transcriptOpen = false)}>Close</button>
+        <div class="transcript-actions">
+          <button
+            class="btn btn-secondary btn-sm"
+            onclick={() => void retranscribe()}
+            disabled={localTranscribing !== null}
+            title="Run the local transcription pipeline again and replace this transcript"
+          >
+            {localTranscribing === transcriptRecording?.id ? "Retranscribing…" : "Retranscribe"}
+          </button>
+          <button class="btn btn-ghost btn-sm" onclick={() => (transcriptOpen = false)}>Close</button>
+        </div>
       </div>
       {#if transcriptLoading}
-        <p class="meta loading-line">Loading transcript…</p>
+        {#if localTranscribing === transcriptRecording?.id}
+          <p class="meta loading-line">
+            {localProgress?.stage ?? "Transcribing…"}{#if localProgress} · {localProgress.percent}%{/if}
+          </p>
+        {:else}
+          <p class="meta loading-line">Loading transcript…</p>
+        {/if}
       {:else}
         <pre class="transcript-view">{transcriptText}</pre>
       {/if}
@@ -647,7 +696,7 @@
     background: rgba(4, 8, 18, 0.62);
   }
   .transcript-dialog {
-    width: min(900px, 100%);
+    width: min(1080px, 100%);
     max-height: min(760px, 90vh);
     display: flex;
     flex-direction: column;
@@ -667,6 +716,12 @@
   .transcript-header h3 {
     margin: 0 0 2px;
     font-size: 1rem;
+  }
+  .transcript-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: none;
   }
   .transcript-view {
     flex: 1;

@@ -37,7 +37,15 @@
   let modelStatus = $state<LocalModelStatus | null>(null);
   let pipelineStatus = $state<LocalPipelineStatus | null>(null);
   let modelProgress = $state<LocalModelProgress | null>(null);
-  let modelBusy = $state(false);
+  // Which download is currently running. Kept separate from `busy` so that only
+  // the relevant section shows its "Downloading" state — clicking one button
+  // must never light up the other section.
+  let downloading = $state<"model" | "pipeline" | "all" | null>(null);
+  // Any model operation (download or delete) in flight — disables the buttons.
+  let busy = $state(false);
+
+  const modelDownloading = $derived(downloading === "model" || downloading === "all");
+  const pipelineDownloading = $derived(downloading === "pipeline" || downloading === "all");
 
   function setTheme(theme: Theme) {
     settings.theme = theme;
@@ -129,23 +137,24 @@
   }
 
   async function downloadModel() {
-    modelBusy = true;
+    busy = true;
+    downloading = "model";
     modelProgress = null;
     error = "";
     try {
       modelStatus = await api.downloadLocalModel();
-      modelProgress = null;
     } catch (e) {
       const message = String(e);
       if (!message.toLowerCase().includes("cancel")) error = message;
-      modelProgress = null;
     } finally {
-      modelBusy = false;
+      downloading = null;
+      modelProgress = null;
+      busy = false;
     }
   }
 
   async function deleteModel() {
-    modelBusy = true;
+    busy = true;
     error = "";
     try {
       await api.deleteLocalModel();
@@ -153,28 +162,54 @@
     } catch (e) {
       error = String(e);
     } finally {
-      modelBusy = false;
+      busy = false;
     }
   }
 
   async function downloadPipeline() {
-    modelBusy = true;
+    busy = true;
+    downloading = "pipeline";
     modelProgress = null;
     error = "";
     try {
       pipelineStatus = await api.downloadLocalPipeline();
-      modelProgress = null;
     } catch (e) {
       const message = String(e);
       if (!message.toLowerCase().includes("cancel")) error = message;
-      modelProgress = null;
     } finally {
-      modelBusy = false;
+      downloading = null;
+      modelProgress = null;
+      busy = false;
+    }
+  }
+
+  // Download every voice model that isn't already installed, in sequence.
+  // Progress events are shared, so `downloading = "all"` lights up both sections.
+  async function downloadAll() {
+    busy = true;
+    downloading = "all";
+    modelProgress = null;
+    error = "";
+    try {
+      if (!modelStatus?.installed) {
+        modelStatus = await api.downloadLocalModel();
+        modelProgress = null;
+      }
+      if (!pipelineStatus?.installed) {
+        pipelineStatus = await api.downloadLocalPipeline();
+      }
+    } catch (e) {
+      const message = String(e);
+      if (!message.toLowerCase().includes("cancel")) error = message;
+    } finally {
+      downloading = null;
+      modelProgress = null;
+      busy = false;
     }
   }
 
   async function deletePipeline() {
-    modelBusy = true;
+    busy = true;
     error = "";
     try {
       await api.deleteLocalPipeline();
@@ -182,7 +217,7 @@
     } catch (e) {
       error = String(e);
     } finally {
-      modelBusy = false;
+      busy = false;
     }
   }
 
@@ -274,9 +309,21 @@
       </div>
       <input type="checkbox" bind:checked={settings.localTranscription} />
     </div>
+    {#if !modelStatus?.installed || !pipelineStatus?.installed}
+      <div class="download-all-row">
+        {#if downloading === "all"}
+          <span class="meta">Downloading all voice models…</span>
+          <button class="btn btn-ghost btn-sm" onclick={cancelModelDownload}>Cancel</button>
+        {:else}
+          <button class="btn btn-primary btn-sm" onclick={downloadAll} disabled={busy}>
+            Download all voice models
+          </button>
+        {/if}
+      </div>
+    {/if}
     <div class="model-row">
       <div class="model-state">
-        {#if modelBusy}
+        {#if modelDownloading}
           <span class="status-pill downloading">Downloading</span>
           <span class="meta">{#if modelProgress}{modelProgress.file} · {formatBytes(modelProgress.downloadedTotal)} / {formatBytes(modelProgress.total)}{:else}Preparing download…{/if}</span>
         {:else if modelStatus?.installed}
@@ -284,27 +331,24 @@
           <span class="meta">
             Ready for local transcription · revision {modelStatus.revision.slice(0, 8)}
           </span>
-        {:else if modelProgress}
-          <span class="status-pill downloading">Downloading</span>
-          <span class="meta">{modelProgress.file} · {formatBytes(modelProgress.downloadedTotal)} / {formatBytes(modelProgress.total)}</span>
         {:else}
           <span class="status-pill">Not installed</span>
           <span class="meta">Download once to enable Parakeet locally.</span>
         {/if}
       </div>
       <div class="model-actions">
-        {#if modelBusy}
-          <button class="btn btn-ghost btn-sm" onclick={cancelModelDownload}>Cancel</button>
+        {#if modelDownloading}
+          <button class="btn btn-ghost btn-sm" onclick={cancelModelDownload} disabled={downloading === "all"}>Cancel</button>
         {:else if modelStatus?.installed}
-          <button class="btn btn-ghost btn-sm" onclick={deleteModel} disabled={modelBusy}>Remove model</button>
+          <button class="btn btn-ghost btn-sm" onclick={deleteModel} disabled={busy}>Remove model</button>
         {:else}
-          <button class="btn btn-secondary btn-sm" onclick={downloadModel} disabled={modelBusy}>
-            {modelBusy ? "Downloading…" : "Download model"}
+          <button class="btn btn-secondary btn-sm" onclick={downloadModel} disabled={busy}>
+            Download model
           </button>
         {/if}
       </div>
     </div>
-    {#if modelProgress}
+    {#if modelDownloading && modelProgress}
       <div class="progress-wrap">
         <div class="progress-bar"><div style={`width: ${(modelProgress.downloadedTotal / Math.max(modelProgress.total, 1)) * 100}%`}></div></div>
       </div>
@@ -327,7 +371,7 @@
     </div>
     <div class="model-row">
       <div class="model-state">
-        {#if modelBusy && !pipelineStatus?.installed}
+        {#if pipelineDownloading}
           <span class="status-pill downloading">Downloading</span>
           <span class="meta">{#if modelProgress}{modelProgress.file} · {formatBytes(modelProgress.downloadedTotal)} / {formatBytes(modelProgress.total)}{:else}Preparing download…{/if}</span>
         {:else if pipelineStatus?.installed}
@@ -339,15 +383,22 @@
         {/if}
       </div>
       <div class="model-actions">
-        {#if pipelineStatus?.installed}
-          <button class="btn btn-ghost btn-sm" onclick={deletePipeline} disabled={modelBusy}>Remove speech models</button>
+        {#if pipelineDownloading}
+          <button class="btn btn-ghost btn-sm" onclick={cancelModelDownload} disabled={downloading === "all"}>Cancel</button>
+        {:else if pipelineStatus?.installed}
+          <button class="btn btn-ghost btn-sm" onclick={deletePipeline} disabled={busy}>Remove speech models</button>
         {:else}
-          <button class="btn btn-secondary btn-sm" onclick={downloadPipeline} disabled={modelBusy}>
-            {modelBusy ? "Downloading…" : "Download speech models"}
+          <button class="btn btn-secondary btn-sm" onclick={downloadPipeline} disabled={busy}>
+            Download speech models
           </button>
         {/if}
       </div>
     </div>
+    {#if pipelineDownloading && modelProgress}
+      <div class="progress-wrap">
+        <div class="progress-bar"><div style={`width: ${(modelProgress.downloadedTotal / Math.max(modelProgress.total, 1)) * 100}%`}></div></div>
+      </div>
+    {/if}
   </fieldset>
 
   <div class="settings-grid">
@@ -579,6 +630,14 @@
   .status-pill.downloading { color: var(--primary); }
 
   .model-actions { flex: none; }
+
+  .download-all-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    margin-top: 10px;
+  }
 
   .progress-wrap { margin-top: 10px; }
 </style>
