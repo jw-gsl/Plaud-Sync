@@ -255,11 +255,16 @@ jobs:
             --title "Plaud Sync v$VERSION" \
             --notes "$BODY"
 
-          # Keep latest.json and this version's files; delete everything else.
+          # Keep latest.json, this version's installers, and the macOS updater
+          # bundle. NOTE: the macOS updater target (Plaud.Sync_aarch64.app.tar.gz,
+          # + .sig) has NO version in its filename and is what latest.json's
+          # darwin-aarch64 entry points to — it must be kept or macOS auto-update
+          # breaks. Delete everything else (old versions' installers/sigs).
           gh release view plaud-sync-latest --repo "$GITHUB_REPOSITORY" \
             --json assets -q '.assets[].name' | while read -r name; do
             case "$name" in
               latest.json) ;;
+              *.app.tar.gz | *.app.tar.gz.sig) ;;
               *_"${VERSION}"_*) ;;
               *)
                 echo "Deleting stale asset: $name"
