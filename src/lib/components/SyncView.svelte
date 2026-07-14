@@ -284,6 +284,21 @@
     }
   }
 
+  let transcriptCopied = $state(false);
+  let copyResetTimer: ReturnType<typeof setTimeout> | null = null;
+
+  async function copyTranscript() {
+    if (!transcriptText) return;
+    try {
+      await navigator.clipboard.writeText(transcriptText);
+      transcriptCopied = true;
+      if (copyResetTimer) clearTimeout(copyResetTimer);
+      copyResetTimer = setTimeout(() => (transcriptCopied = false), 1500);
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
   // Re-run the local pipeline for the recording currently shown in the dialog
   // and reload its text, without closing the dialog. Used after a model swap or
   // to pick up tuning changes.
@@ -521,6 +536,21 @@
             title="Run the local transcription pipeline again and replace this transcript"
           >
             {localTranscribing === transcriptRecording?.id ? "Retranscribing…" : "Retranscribe"}
+          </button>
+          <button
+            class="btn btn-ghost btn-sm"
+            onclick={() => void copyTranscript()}
+            disabled={!transcriptText || transcriptLoading}
+            title="Copy the whole transcript to the clipboard"
+          >
+            {transcriptCopied ? "Copied!" : "Copy all"}
+          </button>
+          <button
+            class="btn btn-ghost btn-sm"
+            onclick={() => transcriptRecording && void api.openLocalTranscript(transcriptRecording)}
+            title="Open the transcript file"
+          >
+            Open file
           </button>
           <button class="btn btn-ghost btn-sm" onclick={() => (transcriptOpen = false)}>Close</button>
         </div>

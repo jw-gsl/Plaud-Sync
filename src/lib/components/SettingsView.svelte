@@ -37,15 +37,16 @@
   let modelStatus = $state<LocalModelStatus | null>(null);
   let pipelineStatus = $state<LocalPipelineStatus | null>(null);
   let modelProgress = $state<LocalModelProgress | null>(null);
-  // Which download is currently running. Kept separate from `busy` so that only
-  // the relevant section shows its "Downloading" state — clicking one button
-  // must never light up the other section.
-  let downloading = $state<"model" | "pipeline" | "all" | null>(null);
-  // Any model operation (download or delete) in flight — disables the buttons.
+  // True while the combined model download is running (drives the "Downloading"
+  // state). `busy` is any model operation (download or delete) — it disables the
+  // buttons.
+  let downloading = $state(false);
   let busy = $state(false);
 
-  const modelDownloading = $derived(downloading === "model" || downloading === "all");
-  const pipelineDownloading = $derived(downloading === "pipeline" || downloading === "all");
+  // Local transcription is a single feature: Parakeet transcription plus speaker
+  // labels. Both model sets install together, so the UI treats them as one.
+  const modelsInstalled = $derived(!!modelStatus?.installed && !!pipelineStatus?.installed);
+  const combinedSizeMb = $derived((modelStatus?.sizeMb ?? 670) + (pipelineStatus?.sizeMb ?? 104));
 
   function setTheme(theme: Theme) {
     settings.theme = theme;
@@ -136,58 +137,12 @@
     }
   }
 
-  async function downloadModel() {
+  // Download the Parakeet transcription model and the speaker-diarization models
+  // together — local transcription is one feature, not two optional pieces. Only
+  // the pieces that aren't already installed are fetched.
+  async function downloadModels() {
     busy = true;
-    downloading = "model";
-    modelProgress = null;
-    error = "";
-    try {
-      modelStatus = await api.downloadLocalModel();
-    } catch (e) {
-      const message = String(e);
-      if (!message.toLowerCase().includes("cancel")) error = message;
-    } finally {
-      downloading = null;
-      modelProgress = null;
-      busy = false;
-    }
-  }
-
-  async function deleteModel() {
-    busy = true;
-    error = "";
-    try {
-      await api.deleteLocalModel();
-      modelStatus = await api.getLocalModelStatus();
-    } catch (e) {
-      error = String(e);
-    } finally {
-      busy = false;
-    }
-  }
-
-  async function downloadPipeline() {
-    busy = true;
-    downloading = "pipeline";
-    modelProgress = null;
-    error = "";
-    try {
-      pipelineStatus = await api.downloadLocalPipeline();
-    } catch (e) {
-      const message = String(e);
-      if (!message.toLowerCase().includes("cancel")) error = message;
-    } finally {
-      downloading = null;
-      modelProgress = null;
-      busy = false;
-    }
-  }
-
-  // Download every voice model that isn't already installed, in sequence.
-  // Progress events are shared, so `downloading = "all"` lights up both sections.
-  async function downloadAll() {
-    busy = true;
-    downloading = "all";
+    downloading = true;
     modelProgress = null;
     error = "";
     try {
@@ -202,18 +157,20 @@
       const message = String(e);
       if (!message.toLowerCase().includes("cancel")) error = message;
     } finally {
-      downloading = null;
+      downloading = false;
       modelProgress = null;
       busy = false;
     }
   }
 
-  async function deletePipeline() {
+  async function deleteModels() {
     busy = true;
     error = "";
     try {
       await api.deleteLocalPipeline();
+      await api.deleteLocalModel();
       pipelineStatus = await api.getLocalPipelineStatus();
+      modelStatus = await api.getLocalModelStatus();
     } catch (e) {
       error = String(e);
     } finally {
@@ -300,101 +257,45 @@
     <legend>Local transcription</legend>
     <div class="toggle-row">
       <div>
-        <strong>Enable Parakeet transcription</strong>
+        <strong>Enable local transcription</strong>
         <div class="meta">
-          Transcribe downloaded recordings on this computer. Audio stays local; the Parakeet v3
-          model is about {modelStatus?.sizeMb ?? 670} MB and works on macOS and Windows. Model
-          revisions are pinned and will be changed only through a Plaud Sync update.
+          Transcribe downloaded recordings on this computer with Parakeet v3 and label who is
+          speaking (Speaker 1, Speaker 2) using on-device voice-activity detection and speaker
+          diarization. Audio stays local and it works on macOS and Windows. The models total about
+          {combinedSizeMb} MB; their revisions are pinned and change only through a Plaud Sync
+          update.
         </div>
       </div>
       <input type="checkbox" bind:checked={settings.localTranscription} />
     </div>
-    {#if !modelStatus?.installed || !pipelineStatus?.installed}
-      <div class="download-all-row">
-        {#if downloading === "all"}
-          <span class="meta">Downloading all voice models…</span>
-          <button class="btn btn-ghost btn-sm" onclick={cancelModelDownload}>Cancel</button>
-        {:else}
-          <button class="btn btn-primary btn-sm" onclick={downloadAll} disabled={busy}>
-            Download all voice models
-          </button>
-        {/if}
-      </div>
-    {/if}
     <div class="model-row">
       <div class="model-state">
-        {#if modelDownloading}
+        {#if downloading}
           <span class="status-pill downloading">Downloading</span>
           <span class="meta">{#if modelProgress}{modelProgress.file} · {formatBytes(modelProgress.downloadedTotal)} / {formatBytes(modelProgress.total)}{:else}Preparing download…{/if}</span>
-        {:else if modelStatus?.installed}
+        {:else if modelsInstalled}
           <span class="status-pill installed">Installed</span>
           <span class="meta">
-            Ready for local transcription · revision {modelStatus.revision.slice(0, 8)}
+            Ready for local transcription with speaker labels · revision {modelStatus?.revision.slice(0, 8)}
           </span>
         {:else}
           <span class="status-pill">Not installed</span>
-          <span class="meta">Download once to enable Parakeet locally.</span>
+          <span class="meta">Download the models once to enable local transcription.</span>
         {/if}
       </div>
       <div class="model-actions">
-        {#if modelDownloading}
-          <button class="btn btn-ghost btn-sm" onclick={cancelModelDownload} disabled={downloading === "all"}>Cancel</button>
-        {:else if modelStatus?.installed}
-          <button class="btn btn-ghost btn-sm" onclick={deleteModel} disabled={busy}>Remove model</button>
+        {#if downloading}
+          <button class="btn btn-ghost btn-sm" onclick={cancelModelDownload}>Cancel</button>
+        {:else if modelsInstalled}
+          <button class="btn btn-ghost btn-sm" onclick={deleteModels} disabled={busy}>Remove models</button>
         {:else}
-          <button class="btn btn-secondary btn-sm" onclick={downloadModel} disabled={busy}>
-            Download model
+          <button class="btn btn-primary btn-sm" onclick={downloadModels} disabled={busy}>
+            Download models
           </button>
         {/if}
       </div>
     </div>
-    {#if modelDownloading && modelProgress}
-      <div class="progress-wrap">
-        <div class="progress-bar"><div style={`width: ${(modelProgress.downloadedTotal / Math.max(modelProgress.total, 1)) * 100}%`}></div></div>
-      </div>
-    {/if}
-  </fieldset>
-
-  <fieldset class="field model-field">
-    <legend>Speaker labels &amp; clean transcript</legend>
-    <div class="toggle-row">
-      <div>
-        <strong>Use voice activity detection and diarization</strong>
-        <div class="meta">
-          Adds speech-only segmentation and automatic Speaker 1, Speaker 2 labels to local
-          transcripts. The models run offline and use about {pipelineStatus?.sizeMb ?? 41} MB.
-        </div>
-      </div>
-      <span class="status-pill" class:installed={pipelineStatus?.installed}>
-        {pipelineStatus?.installed ? "Ready" : "Optional"}
-      </span>
-    </div>
-    <div class="model-row">
-      <div class="model-state">
-        {#if pipelineDownloading}
-          <span class="status-pill downloading">Downloading</span>
-          <span class="meta">{#if modelProgress}{modelProgress.file} · {formatBytes(modelProgress.downloadedTotal)} / {formatBytes(modelProgress.total)}{:else}Preparing download…{/if}</span>
-        {:else if pipelineStatus?.installed}
-          <span class="status-pill installed">Installed</span>
-          <span class="meta">VAD and speaker model ready · pinned release</span>
-        {:else}
-          <span class="status-pill">Not installed</span>
-          <span class="meta">Without this pack, Parakeet still transcribes but cannot label speakers.</span>
-        {/if}
-      </div>
-      <div class="model-actions">
-        {#if pipelineDownloading}
-          <button class="btn btn-ghost btn-sm" onclick={cancelModelDownload} disabled={downloading === "all"}>Cancel</button>
-        {:else if pipelineStatus?.installed}
-          <button class="btn btn-ghost btn-sm" onclick={deletePipeline} disabled={busy}>Remove speech models</button>
-        {:else}
-          <button class="btn btn-secondary btn-sm" onclick={downloadPipeline} disabled={busy}>
-            Download speech models
-          </button>
-        {/if}
-      </div>
-    </div>
-    {#if pipelineDownloading && modelProgress}
+    {#if downloading && modelProgress}
       <div class="progress-wrap">
         <div class="progress-bar"><div style={`width: ${(modelProgress.downloadedTotal / Math.max(modelProgress.total, 1)) * 100}%`}></div></div>
       </div>
@@ -630,14 +531,6 @@
   .status-pill.downloading { color: var(--primary); }
 
   .model-actions { flex: none; }
-
-  .download-all-row {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 12px;
-    margin-top: 10px;
-  }
 
   .progress-wrap { margin-top: 10px; }
 </style>
