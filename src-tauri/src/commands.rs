@@ -1,12 +1,14 @@
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
 use crate::browser_login;
-use crate::plaud::{PlaudAuth, PlaudClient};
 use crate::plaud::types::PlaudRecording;
+use crate::plaud::{PlaudAuth, PlaudClient};
 use crate::state::AppState;
 use crate::storage::AppSettings;
-use crate::sync::{example_path, mark_downloaded_status, sync_recordings};
+use crate::sync::{
+    example_path, mark_downloaded_status, mark_local_transcript_status, sync_recordings,
+};
 
 pub use crate::app_types::AuthStatus;
 
@@ -138,6 +140,7 @@ pub async fn list_recordings(state: State<'_, AppState>) -> Result<Vec<PlaudReco
 
     let mut recordings = client.list_recordings().await?;
     mark_downloaded_status(&mut recordings, &settings);
+    mark_local_transcript_status(&mut recordings, &settings);
     // Cache the fresh list so the UI can render instantly next time / offline.
     let _ = storage.save_recordings_cache(&recordings);
     Ok(recordings)
@@ -151,11 +154,285 @@ pub fn get_cached_recordings(state: State<'_, AppState>) -> Result<Vec<PlaudReco
     let settings = storage.get_settings();
     let mut recordings = storage.get_recordings_cache();
     mark_downloaded_status(&mut recordings, &settings);
+    mark_local_transcript_status(&mut recordings, &settings);
     Ok(recordings)
 }
 
 #[tauri::command]
-pub async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<crate::sync::SyncResult, String> {
+pub fn get_local_model_status(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<crate::transcription::LocalModelStatus, String> {
+    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let mut status = crate::transcription::model_store::model_status(&app_data);
+    status.downloading = state
+        .local_model_download_running
+        .load(std::sync::atomic::Ordering::Acquire);
+    Ok(status)
+}
+
+#[tauri::command]
+pub fn get_local_pipeline_status(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<crate::transcription::LocalPipelineStatus, String> {
+    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let mut status = crate::transcription::model_store::pipeline_model_status(&app_data);
+    status.downloading = state
+        .local_model_download_running
+        .load(std::sync::atomic::Ordering::Acquire);
+    Ok(status)
+}
+
+#[tauri::command]
+pub async fn download_local_pipeline(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<crate::transcription::LocalPipelineStatus, String> {
+    if state
+        .local_model_download_running
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        return Err("A local model download is already running.".to_string());
+    }
+    if state
+        .local_transcription_running
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        state
+            .local_model_download_running
+            .store(false, std::sync::atomic::Ordering::Release);
+        return Err(
+            "Wait for the active transcription to finish before downloading speech models."
+                .to_string(),
+        );
+    }
+    state
+        .local_model_download_cancelled
+        .store(false, std::sync::atomic::Ordering::Release);
+    let _permit = ModelDownloadPermit(&state.local_model_download_running);
+    crate::transcription::model_store::download_pipeline_model(
+        &app,
+        &state.local_model_download_cancelled,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn delete_local_pipeline(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if state
+        .local_model_download_running
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err("Cancel the model download before removing speech models.".to_string());
+    }
+    if state
+        .local_transcription_running
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err(
+            "Wait for the active transcription to finish before removing speech models."
+                .to_string(),
+        );
+    }
+    crate::transcription::model_store::delete_pipeline_model(&app).await
+}
+
+#[tauri::command]
+pub async fn download_local_model(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<crate::transcription::LocalModelStatus, String> {
+    if state
+        .local_model_download_running
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        return Err("A local model download is already running.".to_string());
+    }
+    if state
+        .local_transcription_running
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        state
+            .local_model_download_running
+            .store(false, std::sync::atomic::Ordering::Release);
+        return Err(
+            "Wait for the active transcription to finish before downloading a model update."
+                .to_string(),
+        );
+    }
+    state
+        .local_model_download_cancelled
+        .store(false, std::sync::atomic::Ordering::Release);
+    let _permit = ModelDownloadPermit(&state.local_model_download_running);
+    crate::transcription::model_store::download_model(&app, &state.local_model_download_cancelled)
+        .await
+}
+
+#[tauri::command]
+pub fn cancel_local_model_download(state: State<'_, AppState>) -> Result<(), String> {
+    if !state
+        .local_model_download_running
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Ok(());
+    }
+    state
+        .local_model_download_cancelled
+        .store(true, std::sync::atomic::Ordering::Release);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn delete_local_model(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    if state
+        .local_model_download_running
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err("Cancel the model download before removing the model.".to_string());
+    }
+    if state
+        .local_transcription_running
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err(
+            "Wait for the active transcription to finish before removing the model.".to_string(),
+        );
+    }
+    crate::transcription::model_store::delete_model(&app).await
+}
+
+#[tauri::command]
+pub async fn transcribe_recording(
+    app: AppHandle,
+    recording: PlaudRecording,
+    state: State<'_, AppState>,
+) -> Result<crate::transcription::LocalTranscriptResult, String> {
+    if state
+        .local_transcription_running
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        return Err(
+            "Another local transcription is already running. Try again when it finishes."
+                .to_string(),
+        );
+    }
+    let _permit = TranscriptionPermit(&state.local_transcription_running);
+    let storage = state.storage.lock().map_err(|e| e.to_string())?.clone();
+    let settings = storage.get_settings();
+    if !settings.local_transcription {
+        return Err("Enable local transcription in Settings first.".to_string());
+    }
+    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    if !crate::transcription::model_store::is_model_ready(&app_data) {
+        return Err(
+            "The Parakeet model is not fully installed. Download it from Settings first."
+                .to_string(),
+        );
+    }
+
+    let root = std::path::PathBuf::from(&settings.download_dir);
+    let base = crate::sync::build_audio_path(&root, &recording, &settings);
+    let audio_path = [base.clone(), base.with_extension("opus")]
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| "Download this recording before transcribing it locally.".to_string())?;
+
+    let emit_progress = |percent: u8, stage: &str| {
+        let _ = app.emit(
+            "local-transcription-progress",
+            crate::transcription::LocalTranscriptionProgress {
+                recording_id: recording.id.clone(),
+                filename: recording.filename.clone(),
+                percent,
+                stage: stage.to_string(),
+            },
+        );
+    };
+    emit_progress(5, "Preparing audio…");
+    let app_data_for_worker = app_data.clone();
+    let audio_for_worker = audio_path.clone();
+    let recording_id_for_worker = recording.id.clone();
+    emit_progress(20, "Transcribing with Parakeet…");
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        crate::transcription::transcribe_file(
+            &audio_for_worker,
+            &app_data_for_worker,
+            &recording_id_for_worker,
+        )
+    })
+    .await
+    .map_err(|e| format!("Local transcription worker failed: {e}"))??;
+    emit_progress(100, "Transcript saved");
+    Ok(result)
+}
+
+#[tauri::command]
+pub fn open_local_transcript(
+    recording: PlaudRecording,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let storage = state.storage.lock().map_err(|e| e.to_string())?;
+    let settings = storage.get_settings();
+    let root = std::path::PathBuf::from(&settings.download_dir);
+    let base = crate::sync::build_audio_path(&root, &recording, &settings);
+    let audio = [base.clone(), base.with_extension("opus")]
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            "Download this recording before opening its local transcript.".to_string()
+        })?;
+    let transcript = audio.with_extension("local.txt");
+    if !transcript.is_file() {
+        return Err("This recording has no local transcript yet.".to_string());
+    }
+    open::that(transcript).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub fn read_local_transcript(
+    recording: PlaudRecording,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let storage = state.storage.lock().map_err(|e| e.to_string())?;
+    let settings = storage.get_settings();
+    let root = std::path::PathBuf::from(&settings.download_dir);
+    let base = crate::sync::build_audio_path(&root, &recording, &settings);
+    let audio = [base.clone(), base.with_extension("opus")]
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            "Download this recording before reading its local transcript.".to_string()
+        })?;
+    let transcript = audio.with_extension("local.txt");
+    std::fs::read_to_string(&transcript)
+        .map_err(|e| format!("Could not read local transcript: {e}"))
+}
+
+struct TranscriptionPermit<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for TranscriptionPermit<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+struct ModelDownloadPermit<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for ModelDownloadPermit<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[tauri::command]
+pub async fn sync_now(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<crate::sync::SyncResult, String> {
     let storage = state.storage.lock().map_err(|e| e.to_string())?.clone();
     let settings = storage.get_settings();
 
@@ -164,9 +441,10 @@ pub async fn sync_now(app: AppHandle, state: State<'_, AppState>) -> Result<crat
     }
 
     let result = sync_recordings(&app, &storage, &settings).await?;
-    state
-        .last_sync_epoch
-        .store(crate::state::now_epoch(), std::sync::atomic::Ordering::Relaxed);
+    state.last_sync_epoch.store(
+        crate::state::now_epoch(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     Ok(result)
 }
 
@@ -184,9 +462,10 @@ pub async fn download_selected(
     }
 
     let result = crate::sync::download_selected(&app, &storage, &settings, &ids).await?;
-    state
-        .last_sync_epoch
-        .store(crate::state::now_epoch(), std::sync::atomic::Ordering::Relaxed);
+    state.last_sync_epoch.store(
+        crate::state::now_epoch(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     Ok(result)
 }
 
@@ -231,7 +510,9 @@ pub fn get_settings(state: State<'_, AppState>) -> Result<AppSettings, String> {
 pub fn save_settings(settings: AppSettings, state: State<'_, AppState>) -> Result<(), String> {
     let storage = state.storage.lock().map_err(|e| e.to_string())?;
     let was_auto = storage.get_settings().auto_sync;
-    storage.save_settings(&settings).map_err(|e| e.to_string())?;
+    storage
+        .save_settings(&settings)
+        .map_err(|e| e.to_string())?;
 
     // Turning auto-sync ON should pull everything not yet saved promptly rather
     // than waiting a full interval — force the loop to run on its next (~60s)
@@ -250,7 +531,10 @@ pub fn get_path_example(settings: AppSettings) -> String {
 }
 
 #[tauri::command]
-pub async fn pick_download_folder(app: AppHandle, state: State<'_, AppState>) -> Result<Option<String>, String> {
+pub async fn pick_download_folder(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
     let folder = app
         .dialog()
         .file()
@@ -262,7 +546,9 @@ pub async fn pick_download_folder(app: AppHandle, state: State<'_, AppState>) ->
         let storage = state.storage.lock().map_err(|e| e.to_string())?;
         let mut settings = storage.get_settings();
         settings.download_dir = path_str.clone();
-        storage.save_settings(&settings).map_err(|e| e.to_string())?;
+        storage
+            .save_settings(&settings)
+            .map_err(|e| e.to_string())?;
         return Ok(Some(path_str));
     }
 

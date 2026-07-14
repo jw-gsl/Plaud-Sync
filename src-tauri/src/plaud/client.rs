@@ -25,17 +25,31 @@ impl PlaudClient {
         base_url(&self.region)
     }
 
-    async fn request(&mut self, path: &str) -> Result<Value, String> {
-        let token = self.auth.get_token().await?;
-        let url = format!("{}{}", self.base_url(), path);
-
-        let res = browser_headers(self.http.get(&url))
+    /// Issue an authenticated GET. Extracted so a request can be replayed with a
+    /// fresh token after a 401 without duplicating the header set.
+    async fn send_get(&self, url: &str, token: &str) -> Result<reqwest::Response, String> {
+        browser_headers(self.http.get(url))
             .header("Authorization", format!("Bearer {token}"))
             .header("Content-Type", "application/json")
             .header("app-platform", "web")
             .send()
             .await
-            .map_err(|e| format!("Network error: {e}"))?;
+            .map_err(|e| format!("Network error: {e}"))
+    }
+
+    async fn request(&mut self, path: &str) -> Result<Value, String> {
+        let url = format!("{}{}", self.base_url(), path);
+        let token = self.auth.get_token().await?;
+        let mut res = self.send_get(&url, &token).await?;
+
+        // A token can be rejected before its `exp` (revocation, clock drift, or
+        // a refresh token we never managed to use). Force a renewal and retry
+        // once rather than failing the whole sync.
+        if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+            crate::login_log::info("got 401 from API — forcing token refresh and retrying once");
+            let token = self.auth.force_refresh().await?;
+            res = self.send_get(&url, &token).await?;
+        }
 
         if !res.status().is_success() {
             return Err(format!("Plaud API error: {}", res.status()));
@@ -74,7 +88,12 @@ impl PlaudClient {
 
         let mut recordings: Vec<PlaudRecording> = list
             .into_iter()
-            .filter(|item| !item.get("is_trash").and_then(|v| v.as_bool()).unwrap_or(false))
+            .filter(|item| {
+                !item
+                    .get("is_trash")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            })
             .filter_map(|item| parse_recording(&item))
             .collect();
 
@@ -165,16 +184,26 @@ impl PlaudClient {
             return Ok((bytes.to_vec(), "mp3".to_string()));
         }
 
+        let dl_url = format!("{}/file/download/{id}", self.base_url());
+        let send_dl = |token: &str| {
+            browser_headers(self.http.get(&dl_url))
+                .header("Authorization", format!("Bearer {token}"))
+                .header("app-platform", "web")
+                .send()
+        };
+
         let token = self.auth.get_token().await?;
-        let res = browser_headers(
-            self.http
-                .get(format!("{}/file/download/{id}", self.base_url())),
-        )
-        .header("Authorization", format!("Bearer {token}"))
-        .header("app-platform", "web")
-        .send()
-        .await
-        .map_err(|e| format!("Download failed: {e}"))?;
+        let mut res = send_dl(&token)
+            .await
+            .map_err(|e| format!("Download failed: {e}"))?;
+
+        if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+            crate::login_log::info("got 401 on download — forcing token refresh and retrying once");
+            let token = self.auth.force_refresh().await?;
+            res = send_dl(&token)
+                .await
+                .map_err(|e| format!("Download failed: {e}"))?;
+        }
 
         if !res.status().is_success() {
             return Err(format!("Download failed: {}", res.status()));
@@ -220,12 +249,16 @@ fn parse_recording(item: &Value) -> Option<PlaudRecording> {
         filename,
         duration: item.get("duration").and_then(|v| v.as_i64()).unwrap_or(0),
         start_time: item.get("start_time").and_then(|v| v.as_i64()).unwrap_or(0),
-        is_trans: item.get("is_trans").and_then(|v| v.as_bool()).unwrap_or(false),
+        is_trans: item
+            .get("is_trans")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
         serial_number: item
             .get("serial_number")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
         downloaded: false,
+        local_transcript: false,
     })
 }

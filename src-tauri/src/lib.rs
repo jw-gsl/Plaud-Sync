@@ -6,6 +6,7 @@ mod plaud;
 mod state;
 mod storage;
 mod sync;
+pub mod transcription;
 
 use state::AppState;
 use storage::Storage;
@@ -41,6 +42,9 @@ pub fn run() {
                 // downloads any new recordings within ~60s of launch instead of
                 // waiting a full interval.
                 last_sync_epoch: std::sync::atomic::AtomicI64::new(0),
+                local_transcription_running: std::sync::atomic::AtomicBool::new(false),
+                local_model_download_running: std::sync::atomic::AtomicBool::new(false),
+                local_model_download_cancelled: std::sync::atomic::AtomicBool::new(false),
             });
 
             let sync_handle = app.handle().clone();
@@ -85,6 +89,16 @@ pub fn run() {
             commands::get_cached_recordings,
             commands::set_autostart,
             commands::get_autostart,
+            commands::get_local_model_status,
+            commands::get_local_pipeline_status,
+            commands::download_local_model,
+            commands::download_local_pipeline,
+            commands::cancel_local_model_download,
+            commands::delete_local_model,
+            commands::delete_local_pipeline,
+            commands::transcribe_recording,
+            commands::open_local_transcript,
+            commands::read_local_transcript,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -1,4 +1,4 @@
-use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::sync::Mutex;
 
 use tokio::sync::oneshot;
@@ -47,4 +47,9 @@ pub struct AppState {
     /// so the "next auto-sync" countdown is valid from startup. Shared with the
     /// auto-sync loop so the countdown matches the real schedule.
     pub last_sync_epoch: AtomicI64,
+    /// Prevents concurrent local ASR jobs from competing for the model's
+    /// memory and CPU. The first MVP intentionally runs one job at a time.
+    pub local_transcription_running: AtomicBool,
+    pub local_model_download_running: AtomicBool,
+    pub local_model_download_cancelled: AtomicBool,
 }

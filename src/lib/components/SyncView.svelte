@@ -2,7 +2,13 @@
   import { listen } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
   import { api } from "../api";
-  import type { Recording, SyncInfo, SyncProgress, SyncResult } from "../types";
+  import type {
+    LocalTranscriptionProgress,
+    Recording,
+    SyncInfo,
+    SyncProgress,
+    SyncResult,
+  } from "../types";
   import { formatDate, formatDuration } from "../utils";
 
   let {
@@ -28,6 +34,12 @@
   let search = $state("");
   let filter = $state<Filter>("all");
   let selected = $state<string[]>([]);
+  let localTranscribing = $state<string | null>(null);
+  let localProgress = $state<LocalTranscriptionProgress | null>(null);
+  let transcriptOpen = $state(false);
+  let transcriptLoading = $state(false);
+  let transcriptText = $state("");
+  let transcriptTitle = $state("");
 
   let lastSynced = $state<number | null>(null);
   let syncInfo = $state<SyncInfo | null>(null);
@@ -79,11 +91,15 @@
     const unlistenAutoErr = listen<string>("auto-sync-error", (e) => {
       error = `Auto-sync failed: ${e.payload}`;
     });
+    const unlistenLocal = listen<LocalTranscriptionProgress>("local-transcription-progress", (e) => {
+      localProgress = e.payload;
+    });
     return () => {
       clearInterval(tick);
       void unlistenProgress.then((fn) => fn());
       void unlistenAuto.then((fn) => fn());
       void unlistenAutoErr.then((fn) => fn());
+      void unlistenLocal.then((fn) => fn());
     };
   });
 
@@ -226,6 +242,44 @@
     if (recording.downloaded) void api.revealRecording(recording);
   }
 
+  async function transcribe(recording: Recording) {
+    if (!recording.downloaded || localTranscribing) return;
+    localTranscribing = recording.id;
+    localProgress = {
+      recordingId: recording.id,
+      filename: recording.filename,
+      percent: 0,
+      stage: "Starting local transcription…",
+    };
+    error = "";
+    try {
+      const result = await api.transcribeRecording(recording);
+      status = `Local transcript saved for ${recording.filename}`;
+      if (result.text) await refreshList();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      localTranscribing = null;
+      localProgress = null;
+    }
+  }
+
+  async function viewTranscript(recording: Recording) {
+    transcriptOpen = true;
+    transcriptLoading = true;
+    transcriptText = "";
+    transcriptTitle = recording.filename;
+    error = "";
+    try {
+      transcriptText = await api.readLocalTranscript(recording);
+    } catch (e) {
+      transcriptOpen = false;
+      error = String(e);
+    } finally {
+      transcriptLoading = false;
+    }
+  }
+
   const downloadLabel = $derived(
     downloading
       ? "Downloading…"
@@ -310,20 +364,72 @@
     </div>
   {/if}
 
+  {#if localProgress}
+    <div class="progress-wrap local-progress">
+      <div class="progress-bar">
+        <div style={`width: ${localProgress.percent}%`}></div>
+      </div>
+      <p class="meta">{localProgress.stage} · {localProgress.filename}</p>
+    </div>
+  {/if}
+
   {#if loading}
     <p class="meta loading-line">Loading…</p>
   {:else if visible.length}
     <div class="rec-list">
       {#each visible as recording (recording.id)}
         {#if recording.downloaded}
-          <button class="rec-row clickable" onclick={() => reveal(recording)} title="Reveal in Finder">
+          <div
+            class="rec-row clickable"
+            role="button"
+            tabindex="0"
+            onclick={() => reveal(recording)}
+            onkeydown={(event) => {
+              if (event.key === "Enter" || event.key === " ") reveal(recording);
+            }}
+            title="Reveal in Finder"
+          >
             <span class="dot done"></span>
             <span class="rec-name">{recording.filename}</span>
             <span class="rec-meta">
-              {formatDate(recording.startTime)} · {formatDuration(recording.duration)}{#if recording.isTrans} · TXT{/if}
+              {formatDate(recording.startTime)} · {formatDuration(recording.duration)}{#if recording.isTrans} · TXT{/if}{#if recording.localTranscript} · Local TXT{/if}
             </span>
-            <span class="rec-state done">Saved</span>
-          </button>
+            <span class="rec-state done">{recording.localTranscript ? "Transcribed" : "Saved"}</span>
+            {#if recording.localTranscript}
+              <button
+                class="btn btn-ghost btn-sm transcribe-btn"
+                onclick={(event) => {
+                  event.stopPropagation();
+                  void viewTranscript(recording);
+                }}
+                title="View the local transcript in Plaud Sync"
+              >
+                View transcript
+              </button>
+              <button
+                class="btn btn-ghost btn-sm transcribe-btn"
+                onclick={(event) => {
+                  event.stopPropagation();
+                  void api.openLocalTranscript(recording);
+                }}
+                title="Open the transcript file"
+              >
+                Open file
+              </button>
+            {:else}
+              <button
+                class="btn btn-ghost btn-sm transcribe-btn"
+                onclick={(event) => {
+                  event.stopPropagation();
+                  void transcribe(recording);
+                }}
+                disabled={localTranscribing !== null}
+                title="Transcribe with the local Parakeet model"
+              >
+                {localTranscribing === recording.id ? "Working…" : "Transcribe"}
+              </button>
+            {/if}
+          </div>
         {:else}
           <div class="rec-row" title="Not downloaded yet">
             {#if showChecks}
@@ -355,6 +461,35 @@
     <p class="meta loading-line">{status}</p>
   {/if}
 </div>
+
+{#if transcriptOpen}
+  <div class="transcript-backdrop" role="presentation" onclick={() => (transcriptOpen = false)}>
+    <div
+      class="transcript-dialog"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Transcript"
+      tabindex="-1"
+      onclick={(event) => event.stopPropagation()}
+      onkeydown={(event) => {
+        if (event.key === "Escape") transcriptOpen = false;
+      }}
+    >
+      <div class="transcript-header">
+        <div>
+          <h3>{transcriptTitle}</h3>
+          <p class="meta">Local transcript · selectable text</p>
+        </div>
+        <button class="btn btn-ghost btn-sm" onclick={() => (transcriptOpen = false)}>Close</button>
+      </div>
+      {#if transcriptLoading}
+        <p class="meta loading-line">Loading transcript…</p>
+      {:else}
+        <pre class="transcript-view">{transcriptText}</pre>
+      {/if}
+    </div>
+  </div>
+{/if}
 
 <style>
   .header-row {
@@ -447,6 +582,10 @@
   .rec-row.clickable:hover {
     background: var(--surface-muted);
   }
+  .rec-row.clickable:focus-visible {
+    outline: 2px solid var(--primary);
+    outline-offset: -2px;
+  }
   .dot {
     width: 7px;
     height: 7px;
@@ -487,9 +626,63 @@
   .rec-state.new {
     color: var(--primary);
   }
+  .transcribe-btn {
+    flex: none;
+    white-space: nowrap;
+  }
+  .local-progress {
+    margin-top: 8px;
+  }
   .status.warn {
     background: var(--pending-bg);
     color: var(--pending-text);
+  }
+  .transcript-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 20;
+    display: grid;
+    place-items: center;
+    padding: 24px;
+    background: rgba(4, 8, 18, 0.62);
+  }
+  .transcript-dialog {
+    width: min(900px, 100%);
+    max-height: min(760px, 90vh);
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 18px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--surface);
+    box-shadow: 0 18px 60px rgba(0, 0, 0, 0.35);
+  }
+  .transcript-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .transcript-header h3 {
+    margin: 0 0 2px;
+    font-size: 1rem;
+  }
+  .transcript-view {
+    flex: 1;
+    min-height: 220px;
+    max-height: 68vh;
+    overflow: auto;
+    margin: 0;
+    padding: 16px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface-muted);
+    color: var(--text);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    user-select: text;
+    font: 0.86rem/1.55 ui-monospace, SFMono-Regular, Menlo, monospace;
   }
   @media (max-width: 640px) {
     .rec-meta {

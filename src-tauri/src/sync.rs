@@ -5,8 +5,8 @@ use chrono::{TimeZone, Utc};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::plaud::{PlaudAuth, PlaudClient};
 use crate::plaud::types::PlaudRecording;
+use crate::plaud::{PlaudAuth, PlaudClient};
 use crate::state::AppState;
 use crate::storage::{AppSettings, Storage};
 
@@ -114,7 +114,9 @@ async fn download_list(
     }
 
     let message = if failed > 0 {
-        format!("Downloaded {downloaded}, {skipped} already saved, {failed} failed (see debug log).")
+        format!(
+            "Downloaded {downloaded}, {skipped} already saved, {failed} failed (see debug log)."
+        )
     } else if downloaded > 0 {
         format!("Downloaded {downloaded} file(s). {skipped} already on disk.")
     } else if skipped > 0 {
@@ -241,16 +243,27 @@ pub async fn auto_sync_loop(app: AppHandle) {
     }
 }
 
-pub fn mark_downloaded_status(
-    recordings: &mut [PlaudRecording],
-    settings: &AppSettings,
-) {
+pub fn mark_downloaded_status(recordings: &mut [PlaudRecording], settings: &AppSettings) {
     let root = PathBuf::from(&settings.download_dir);
     for rec in recordings.iter_mut() {
         let path = build_audio_path(&root, rec, settings);
         rec.downloaded = path.exists()
             || path.with_extension("mp3").exists()
             || path.with_extension("opus").exists();
+    }
+}
+
+pub fn mark_local_transcript_status(recordings: &mut [PlaudRecording], settings: &AppSettings) {
+    let root = PathBuf::from(&settings.download_dir);
+    for rec in recordings.iter_mut() {
+        let base = build_audio_path(&root, rec, settings);
+        let audio = [base.clone(), base.with_extension("opus")]
+            .into_iter()
+            .find(|path| path.is_file());
+        rec.local_transcript = audio
+            .as_deref()
+            .map(crate::transcription::local_transcript_exists)
+            .unwrap_or(false);
     }
 }
 
@@ -291,10 +304,14 @@ pub fn example_path(settings: &AppSettings) -> String {
         id: "sample".into(),
         filename: "Team Standup".into(),
         duration: 1_800_000,
-        start_time: Utc.with_ymd_and_hms(2025, 6, 8, 10, 0, 0).unwrap().timestamp_millis(),
+        start_time: Utc
+            .with_ymd_and_hms(2025, 6, 8, 10, 0, 0)
+            .unwrap()
+            .timestamp_millis(),
         is_trans: true,
         serial_number: "NOTE-PRO-001".into(),
         downloaded: false,
+        local_transcript: false,
     };
     build_audio_path(Path::new(settings.download_dir.as_str()), &sample, settings)
         .to_string_lossy()
@@ -311,9 +328,7 @@ fn build_filename(recording: &PlaudRecording, settings: &AppSettings) -> String 
 fn build_info_file(name: &str, start_time: i64, duration_ms: i64, transcript: &str) -> String {
     let date = format_date(start_time);
     let duration = format_duration(duration_ms);
-    let mut content = format!(
-        "Title: {name}\nDate: {date}\nDuration: {duration}\nSource: Plaud\n"
-    );
+    let mut content = format!("Title: {name}\nDate: {date}\nDuration: {duration}\nSource: Plaud\n");
     if !transcript.is_empty() {
         content.push_str("\n--- Transcript ---\n\n");
         content.push_str(transcript);
@@ -392,10 +407,14 @@ mod tests {
             filename: "Team Standup, June".into(),
             duration: 1_800_000,
             // 2025-06-08 (timestamp_millis)
-            start_time: Utc.with_ymd_and_hms(2025, 6, 8, 10, 0, 0).unwrap().timestamp_millis(),
+            start_time: Utc
+                .with_ymd_and_hms(2025, 6, 8, 10, 0, 0)
+                .unwrap()
+                .timestamp_millis(),
             is_trans: true,
             serial_number: "NOTE-PRO-1".into(),
             downloaded: false,
+            local_transcript: false,
         }
     }
 
@@ -417,13 +436,20 @@ mod tests {
 
     #[test]
     fn sanitize_filename_keeps_title_strips_illegal() {
-        assert_eq!(sanitize_filename("Team Standup, June"), "Team Standup, June");
+        assert_eq!(
+            sanitize_filename("Team Standup, June"),
+            "Team Standup, June"
+        );
         assert_eq!(sanitize_filename("a/b:c*?\"<>|d"), "a-b-c------d");
     }
 
     #[test]
     fn build_audio_path_flat_clean() {
-        let p = build_audio_path(Path::new("/tmp/plaud"), &sample(), &settings("flat", "clean"));
+        let p = build_audio_path(
+            Path::new("/tmp/plaud"),
+            &sample(),
+            &settings("flat", "clean"),
+        );
         assert_eq!(
             p.to_string_lossy().replace('\\', "/"),
             "/tmp/plaud/MyRecordings/Team-Standup--June.mp3"
@@ -432,7 +458,11 @@ mod tests {
 
     #[test]
     fn build_audio_path_by_date_original() {
-        let p = build_audio_path(Path::new("/tmp/plaud"), &sample(), &settings("by_date", "original"));
+        let p = build_audio_path(
+            Path::new("/tmp/plaud"),
+            &sample(),
+            &settings("by_date", "original"),
+        );
         assert_eq!(
             p.to_string_lossy().replace('\\', "/"),
             "/tmp/plaud/MyRecordings/2025-06-08/Team Standup, June.mp3"

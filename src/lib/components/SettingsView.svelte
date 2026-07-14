@@ -1,6 +1,8 @@
 <script lang="ts">
+  import { listen } from "@tauri-apps/api/event";
+  import { onMount } from "svelte";
   import { api } from "../api";
-  import type { AppSettings } from "../types";
+  import type { AppSettings, LocalModelProgress, LocalModelStatus, LocalPipelineStatus } from "../types";
   import type { UpdateStatus } from "../updater";
   import { applyTheme, type Theme } from "../utils";
 
@@ -29,8 +31,13 @@
     autoSyncMinutes: 15,
     theme: "system",
     startMinimized: false,
+    localTranscription: true,
   });
   let autostart = $state(false);
+  let modelStatus = $state<LocalModelStatus | null>(null);
+  let pipelineStatus = $state<LocalPipelineStatus | null>(null);
+  let modelProgress = $state<LocalModelProgress | null>(null);
+  let modelBusy = $state(false);
 
   function setTheme(theme: Theme) {
     settings.theme = theme;
@@ -82,6 +89,16 @@
     settings = await api.getSettings();
     await refreshExample(settings);
     try {
+      modelStatus = await api.getLocalModelStatus();
+    } catch {
+      // The model status is non-critical to the rest of Settings.
+    }
+    try {
+      pipelineStatus = await api.getLocalPipelineStatus();
+    } catch {
+      // Optional speech-processing models are non-critical to Settings.
+    }
+    try {
       autostart = await api.getAutostart();
     } catch {
       // ignore
@@ -110,6 +127,86 @@
       saving = false;
     }
   }
+
+  async function downloadModel() {
+    modelBusy = true;
+    modelProgress = null;
+    error = "";
+    try {
+      modelStatus = await api.downloadLocalModel();
+      modelProgress = null;
+    } catch (e) {
+      const message = String(e);
+      if (!message.toLowerCase().includes("cancel")) error = message;
+      modelProgress = null;
+    } finally {
+      modelBusy = false;
+    }
+  }
+
+  async function deleteModel() {
+    modelBusy = true;
+    error = "";
+    try {
+      await api.deleteLocalModel();
+      modelStatus = await api.getLocalModelStatus();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      modelBusy = false;
+    }
+  }
+
+  async function downloadPipeline() {
+    modelBusy = true;
+    modelProgress = null;
+    error = "";
+    try {
+      pipelineStatus = await api.downloadLocalPipeline();
+      modelProgress = null;
+    } catch (e) {
+      const message = String(e);
+      if (!message.toLowerCase().includes("cancel")) error = message;
+      modelProgress = null;
+    } finally {
+      modelBusy = false;
+    }
+  }
+
+  async function deletePipeline() {
+    modelBusy = true;
+    error = "";
+    try {
+      await api.deleteLocalPipeline();
+      pipelineStatus = await api.getLocalPipelineStatus();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      modelBusy = false;
+    }
+  }
+
+  async function cancelModelDownload() {
+    try {
+      await api.cancelLocalModelDownload();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  function formatBytes(bytes: number): string {
+    if (bytes < 1_000_000) return `${Math.round(bytes / 1_000)} KB`;
+    return `${(bytes / 1_000_000).toFixed(bytes >= 1_000_000_000 ? 1 : 0)} MB`;
+  }
+
+  onMount(() => {
+    const unlisten = listen<LocalModelProgress>("local-model-progress", (event) => {
+      modelProgress = event.payload;
+    });
+    return () => {
+      void unlisten.then((dispose) => dispose());
+    };
+  });
 
   load();
 </script>
@@ -163,6 +260,95 @@
       <button class="btn btn-ghost" onclick={() => api.openDownloadFolder()}>Open</button>
     </div>
   </div>
+
+  <fieldset class="field model-field">
+    <legend>Local transcription</legend>
+    <div class="toggle-row">
+      <div>
+        <strong>Enable Parakeet transcription</strong>
+        <div class="meta">
+          Transcribe downloaded recordings on this computer. Audio stays local; the Parakeet v3
+          model is about {modelStatus?.sizeMb ?? 670} MB and works on macOS and Windows. Model
+          revisions are pinned and will be changed only through a Plaud Sync update.
+        </div>
+      </div>
+      <input type="checkbox" bind:checked={settings.localTranscription} />
+    </div>
+    <div class="model-row">
+      <div class="model-state">
+        {#if modelBusy}
+          <span class="status-pill downloading">Downloading</span>
+          <span class="meta">{#if modelProgress}{modelProgress.file} · {formatBytes(modelProgress.downloadedTotal)} / {formatBytes(modelProgress.total)}{:else}Preparing download…{/if}</span>
+        {:else if modelStatus?.installed}
+          <span class="status-pill installed">Installed</span>
+          <span class="meta">
+            Ready for local transcription · revision {modelStatus.revision.slice(0, 8)}
+          </span>
+        {:else if modelProgress}
+          <span class="status-pill downloading">Downloading</span>
+          <span class="meta">{modelProgress.file} · {formatBytes(modelProgress.downloadedTotal)} / {formatBytes(modelProgress.total)}</span>
+        {:else}
+          <span class="status-pill">Not installed</span>
+          <span class="meta">Download once to enable Parakeet locally.</span>
+        {/if}
+      </div>
+      <div class="model-actions">
+        {#if modelBusy}
+          <button class="btn btn-ghost btn-sm" onclick={cancelModelDownload}>Cancel</button>
+        {:else if modelStatus?.installed}
+          <button class="btn btn-ghost btn-sm" onclick={deleteModel} disabled={modelBusy}>Remove model</button>
+        {:else}
+          <button class="btn btn-secondary btn-sm" onclick={downloadModel} disabled={modelBusy}>
+            {modelBusy ? "Downloading…" : "Download model"}
+          </button>
+        {/if}
+      </div>
+    </div>
+    {#if modelProgress}
+      <div class="progress-wrap">
+        <div class="progress-bar"><div style={`width: ${(modelProgress.downloadedTotal / Math.max(modelProgress.total, 1)) * 100}%`}></div></div>
+      </div>
+    {/if}
+  </fieldset>
+
+  <fieldset class="field model-field">
+    <legend>Speaker labels &amp; clean transcript</legend>
+    <div class="toggle-row">
+      <div>
+        <strong>Use voice activity detection and diarization</strong>
+        <div class="meta">
+          Adds speech-only segmentation and automatic Speaker 1, Speaker 2 labels to local
+          transcripts. The models run offline and use about {pipelineStatus?.sizeMb ?? 41} MB.
+        </div>
+      </div>
+      <span class="status-pill" class:installed={pipelineStatus?.installed}>
+        {pipelineStatus?.installed ? "Ready" : "Optional"}
+      </span>
+    </div>
+    <div class="model-row">
+      <div class="model-state">
+        {#if modelBusy && !pipelineStatus?.installed}
+          <span class="status-pill downloading">Downloading</span>
+          <span class="meta">{#if modelProgress}{modelProgress.file} · {formatBytes(modelProgress.downloadedTotal)} / {formatBytes(modelProgress.total)}{:else}Preparing download…{/if}</span>
+        {:else if pipelineStatus?.installed}
+          <span class="status-pill installed">Installed</span>
+          <span class="meta">VAD and speaker model ready · pinned release</span>
+        {:else}
+          <span class="status-pill">Not installed</span>
+          <span class="meta">Without this pack, Parakeet still transcribes but cannot label speakers.</span>
+        {/if}
+      </div>
+      <div class="model-actions">
+        {#if pipelineStatus?.installed}
+          <button class="btn btn-ghost btn-sm" onclick={deletePipeline} disabled={modelBusy}>Remove speech models</button>
+        {:else}
+          <button class="btn btn-secondary btn-sm" onclick={downloadPipeline} disabled={modelBusy}>
+            {modelBusy ? "Downloading…" : "Download speech models"}
+          </button>
+        {/if}
+      </div>
+    </div>
+  </fieldset>
 
   <div class="settings-grid">
     <div class="col">
@@ -358,4 +544,41 @@
     color: var(--text-muted);
     font-size: 0.85rem;
   }
+
+  .model-field {
+    margin-top: 4px;
+  }
+
+  .model-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    margin-top: 10px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    background: var(--surface-muted);
+  }
+
+  .model-state {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .status-pill {
+    font-size: 0.7rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    white-space: nowrap;
+  }
+
+  .status-pill.installed { color: var(--success); }
+  .status-pill.downloading { color: var(--primary); }
+
+  .model-actions { flex: none; }
+
+  .progress-wrap { margin-top: 10px; }
 </style>
