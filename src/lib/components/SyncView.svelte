@@ -552,6 +552,13 @@
           >
             Open file
           </button>
+          <button
+            class="btn btn-ghost btn-sm"
+            onclick={() => transcriptRecording && void api.revealRecording(transcriptRecording)}
+            title="Reveal the recording and transcript in Finder"
+          >
+            Open folder
+          </button>
           <button class="btn btn-ghost btn-sm" onclick={() => (transcriptOpen = false)}>Close</button>
         </div>
       </div>
