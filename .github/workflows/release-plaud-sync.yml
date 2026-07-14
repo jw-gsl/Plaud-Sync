@@ -216,3 +216,60 @@ jobs:
             echo "Authoritative remaining balance: your **SSL.com → eSigner dashboard**."
             if [ "$n" -gt 0 ]; then echo ""; echo "Files signed this run:"; sed 's/^/- /' "$f"; fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # tauri-action uploads the new bundles and refreshes latest.json, but it does
+  # NOT overwrite the title/body of a pre-existing rolling release, and it leaves
+  # every prior version's installers attached. This job runs once after both
+  # platforms finish to: (1) set the release title + notes to the shipped
+  # version (notes taken from CHANGELOG.md), and (2) delete stale assets so the
+  # release only shows the current version's files plus latest.json.
+  finalize:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update release title/notes and prune old assets
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(python3 -c "import json;print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
+          echo "Finalizing rolling release for version $VERSION"
+
+          # Release notes for this version from CHANGELOG.md (same extraction the
+          # build job uses for tauri-action's releaseBody).
+          NOTES=$(awk -v hdr="## [$VERSION]" '
+            index($0, hdr) == 1 { found=1; next }
+            /^## \[/ { if (found) exit }
+            found { print }
+          ' CHANGELOG.md | awk 'NF{last=NR} {line[NR]=$0} END{first=1; while(first<=last && line[first]=="") first++; for(i=first;i<=last;i++) print line[i]}')
+          if [ -z "$NOTES" ]; then NOTES="See CHANGELOG.md for details."; fi
+          BODY=$(printf '%s\n\n%s\n' "$NOTES" 'New install: download the `.dmg` (macOS) or `-setup.exe` (Windows) below.')
+
+          gh release edit plaud-sync-latest \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Plaud Sync v$VERSION" \
+            --notes "$BODY"
+
+          # Keep latest.json, this version's installers, and the macOS updater
+          # bundle. NOTE: the macOS updater target (Plaud.Sync_aarch64.app.tar.gz,
+          # + .sig) has NO version in its filename and is what latest.json's
+          # darwin-aarch64 entry points to — it must be kept or macOS auto-update
+          # breaks. Delete everything else (old versions' installers/sigs).
+          gh release view plaud-sync-latest --repo "$GITHUB_REPOSITORY" \
+            --json assets -q '.assets[].name' | while read -r name; do
+            case "$name" in
+              latest.json) ;;
+              *.app.tar.gz | *.app.tar.gz.sig) ;;
+              *_"${VERSION}"_*) ;;
+              *)
+                echo "Deleting stale asset: $name"
+                gh release delete-asset plaud-sync-latest "$name" \
+                  --repo "$GITHUB_REPOSITORY" --yes
+                ;;
+            esac
+          done
