@@ -3,6 +3,9 @@
   import { onMount } from "svelte";
   import { api } from "../api";
   import type {
+    LocalModelProgress,
+    LocalModelStatus,
+    LocalPipelineStatus,
     LocalTranscriptionProgress,
     Recording,
     SyncInfo,
@@ -36,6 +39,13 @@
   let selected = $state<string[]>([]);
   let localTranscribing = $state<string | null>(null);
   let localProgress = $state<LocalTranscriptionProgress | null>(null);
+  // Local-model install state, so the row can offer to download the models when
+  // they are missing instead of failing a transcription.
+  let modelStatus = $state<LocalModelStatus | null>(null);
+  let pipelineStatus = $state<LocalPipelineStatus | null>(null);
+  let downloadingModels = $state(false);
+  let modelDownloadProgress = $state<LocalModelProgress | null>(null);
+  const modelsInstalled = $derived(!!modelStatus?.installed && !!pipelineStatus?.installed);
   let transcriptOpen = $state(false);
   let transcriptLoading = $state(false);
   let transcriptText = $state("");
@@ -97,12 +107,16 @@
     const unlistenLocal = listen<LocalTranscriptionProgress>("local-transcription-progress", (e) => {
       localProgress = e.payload;
     });
+    const unlistenModel = listen<LocalModelProgress>("local-model-progress", (e) => {
+      modelDownloadProgress = e.payload;
+    });
     return () => {
       clearInterval(tick);
       void unlistenProgress.then((fn) => fn());
       void unlistenAuto.then((fn) => fn());
       void unlistenAutoErr.then((fn) => fn());
       void unlistenLocal.then((fn) => fn());
+      void unlistenModel.then((fn) => fn());
     };
   });
 
@@ -161,6 +175,20 @@
     } finally {
       loading = false;
       await refreshSyncInfo();
+      await refreshModelStatus();
+    }
+  }
+
+  async function refreshModelStatus() {
+    try {
+      modelStatus = await api.getLocalModelStatus();
+    } catch {
+      // Non-critical — the row just falls back to offering the download.
+    }
+    try {
+      pipelineStatus = await api.getLocalPipelineStatus();
+    } catch {
+      // ignore
     }
   }
 
@@ -260,10 +288,49 @@
       status = `Local transcript saved for ${recording.filename}`;
       if (result.text) await refreshList();
     } catch (e) {
-      error = String(e);
+      const message = String(e);
+      if (message.toLowerCase().includes("cancel")) {
+        status = `Transcription cancelled for ${recording.filename}`;
+      } else {
+        error = message;
+      }
     } finally {
       localTranscribing = null;
       localProgress = null;
+    }
+  }
+
+  async function cancelTranscription() {
+    try {
+      await api.cancelLocalTranscription();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  // Download the local models (Parakeet + speaker diarization) so a recording
+  // can be transcribed. Used when the row's Transcribe button is clicked but the
+  // models aren't installed yet.
+  async function downloadModels() {
+    if (downloadingModels) return;
+    downloadingModels = true;
+    modelDownloadProgress = null;
+    error = "";
+    try {
+      if (!modelStatus?.installed) {
+        modelStatus = await api.downloadLocalModel();
+        modelDownloadProgress = null;
+      }
+      if (!pipelineStatus?.installed) {
+        pipelineStatus = await api.downloadLocalPipeline();
+      }
+      status = "Local models installed — you can transcribe now.";
+    } catch (e) {
+      const message = String(e);
+      if (!message.toLowerCase().includes("cancel")) error = message;
+    } finally {
+      downloadingModels = false;
+      modelDownloadProgress = null;
     }
   }
 
@@ -320,7 +387,9 @@
       status = `Local transcript refreshed for ${recording.filename}`;
       await refreshList();
     } catch (e) {
-      error = String(e);
+      const message = String(e);
+      // On cancel, keep the existing transcript text in the pane.
+      if (!message.toLowerCase().includes("cancel")) error = message;
     } finally {
       localTranscribing = null;
       localProgress = null;
@@ -421,6 +490,19 @@
     </div>
   {/if}
 
+  {#if downloadingModels}
+    <div class="progress-wrap local-progress">
+      <div class="progress-bar">
+        <div
+          style={`width: ${modelDownloadProgress ? (modelDownloadProgress.downloadedTotal / Math.max(modelDownloadProgress.total, 1)) * 100 : 0}%`}
+        ></div>
+      </div>
+      <p class="meta">
+        {#if modelDownloadProgress}Downloading models · {modelDownloadProgress.file}{:else}Preparing model download…{/if}
+      </p>
+    </div>
+  {/if}
+
   {#if loading}
     <p class="meta loading-line">Loading…</p>
   {:else if visible.length}
@@ -464,6 +546,29 @@
               >
                 Open file
               </button>
+            {:else if !modelsInstalled}
+              <button
+                class="btn btn-ghost btn-sm transcribe-btn"
+                onclick={(event) => {
+                  event.stopPropagation();
+                  void downloadModels();
+                }}
+                disabled={downloadingModels}
+                title="Download the local transcription models, then transcribe"
+              >
+                {downloadingModels ? "Downloading models…" : "Download models"}
+              </button>
+            {:else if localTranscribing === recording.id}
+              <button
+                class="btn btn-ghost btn-sm transcribe-btn"
+                onclick={(event) => {
+                  event.stopPropagation();
+                  void cancelTranscription();
+                }}
+                title="Cancel this transcription"
+              >
+                Cancel
+              </button>
             {:else}
               <button
                 class="btn btn-ghost btn-sm transcribe-btn"
@@ -471,10 +576,10 @@
                   event.stopPropagation();
                   void transcribe(recording);
                 }}
-                disabled={localTranscribing !== null}
+                disabled={localTranscribing !== null || downloadingModels}
                 title="Transcribe with the local Parakeet model"
               >
-                {localTranscribing === recording.id ? "Working…" : "Transcribe"}
+                Transcribe
               </button>
             {/if}
           </div>
@@ -529,14 +634,24 @@
           <p class="meta">Local transcript · selectable text</p>
         </div>
         <div class="transcript-actions">
-          <button
-            class="btn btn-secondary btn-sm"
-            onclick={() => void retranscribe()}
-            disabled={localTranscribing !== null}
-            title="Run the local transcription pipeline again and replace this transcript"
-          >
-            {localTranscribing === transcriptRecording?.id ? "Retranscribing…" : "Retranscribe"}
-          </button>
+          {#if localTranscribing === transcriptRecording?.id}
+            <button
+              class="btn btn-secondary btn-sm"
+              onclick={() => void cancelTranscription()}
+              title="Cancel this transcription"
+            >
+              Cancel
+            </button>
+          {:else}
+            <button
+              class="btn btn-secondary btn-sm"
+              onclick={() => void retranscribe()}
+              disabled={localTranscribing !== null}
+              title="Run the local transcription pipeline again and replace this transcript"
+            >
+              Retranscribe
+            </button>
+          {/if}
           <button
             class="btn btn-ghost btn-sm"
             onclick={() => void copyTranscript()}

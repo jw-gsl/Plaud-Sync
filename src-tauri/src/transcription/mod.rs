@@ -2,6 +2,7 @@ mod audio;
 pub mod model_store;
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Serialize;
 use sherpa_onnx::{
@@ -18,6 +19,9 @@ const SAMPLE_RATE: i32 = 16_000;
 // a margin below its ~200-second limit so long recordings cannot trigger an
 // ONNX shape exception (which would otherwise abort across the C FFI boundary).
 const MAX_CHUNK_SAMPLES: usize = 180 * SAMPLE_RATE as usize;
+/// Error message returned when a transcription is cancelled. The Tauri command
+/// and the UI both match on "cancel" to treat it as a no-op, not a failure.
+const CANCELLED: &str = "Local transcription cancelled";
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -90,6 +94,7 @@ pub fn transcribe_file(
     audio_path: &Path,
     app_data_dir: &Path,
     recording_id: &str,
+    cancelled: &AtomicBool,
 ) -> Result<LocalTranscriptResult, String> {
     let Some((encoder, decoder, joiner, tokens)) = model_store::model_paths(app_data_dir) else {
         return Err(
@@ -100,6 +105,9 @@ pub fn transcribe_file(
 
     let samples = audio::decode_to_16khz_mono(audio_path)?;
     let duration = samples.len() as f32 / SAMPLE_RATE as f32;
+    if cancelled.load(Ordering::Acquire) {
+        return Err(CANCELLED.to_string());
+    }
 
     let mut config = OfflineRecognizerConfig::default();
     config.model_config.transducer = OfflineTransducerModelConfig {
@@ -132,6 +140,9 @@ pub fn transcribe_file(
     for (range_start, range_end) in asr_ranges {
         let mut range_offset = range_start;
         for chunk in samples[range_start..range_end].chunks(MAX_CHUNK_SAMPLES) {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(CANCELLED.to_string());
+            }
             let stream = recognizer.create_stream();
             stream.accept_waveform(SAMPLE_RATE, chunk);
             recognizer.decode(&stream);
@@ -161,6 +172,9 @@ pub fn transcribe_file(
         }
     }
 
+    if cancelled.load(Ordering::Acquire) {
+        return Err(CANCELLED.to_string());
+    }
     let diarization_segments = pipeline_paths
         .as_ref()
         .and_then(|paths| detect_speakers(&samples, paths));

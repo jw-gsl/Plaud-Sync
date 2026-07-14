@@ -321,6 +321,11 @@ pub async fn transcribe_recording(
         );
     }
     let _permit = TranscriptionPermit(&state.local_transcription_running);
+    // Clear any cancellation left over from a previous run before we start.
+    state
+        .local_transcription_cancelled
+        .store(false, std::sync::atomic::Ordering::Release);
+    let cancelled = state.local_transcription_cancelled.clone();
     let storage = state.storage.lock().map_err(|e| e.to_string())?.clone();
     let settings = storage.get_settings();
     if !settings.local_transcription {
@@ -362,12 +367,29 @@ pub async fn transcribe_recording(
             &audio_for_worker,
             &app_data_for_worker,
             &recording_id_for_worker,
+            &cancelled,
         )
     })
     .await
     .map_err(|e| format!("Local transcription worker failed: {e}"))??;
     emit_progress(100, "Transcript saved");
     Ok(result)
+}
+
+/// Ask a running local transcription to stop. The blocking worker polls the
+/// shared flag at checkpoints and returns a "cancelled" error, which the UI
+/// treats as a no-op rather than a failure.
+#[tauri::command]
+pub fn cancel_local_transcription(state: State<'_, AppState>) -> Result<(), String> {
+    if state
+        .local_transcription_running
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        state
+            .local_transcription_cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    Ok(())
 }
 
 #[tauri::command]

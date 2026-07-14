@@ -46,6 +46,7 @@ export const api = {
   deleteLocalPipeline: () => invoke<void>("delete_local_pipeline"),
   transcribeRecording: (recording: Recording) =>
     invoke<LocalTranscriptResult>("transcribe_recording", { recording }),
+  cancelLocalTranscription: () => invoke<void>("cancel_local_transcription"),
   openLocalTranscript: (recording: Recording) =>
     invoke<void>("open_local_transcript", { recording }),
   readLocalTranscript: (recording: Recording) =>

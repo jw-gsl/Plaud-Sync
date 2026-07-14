@@ -43,6 +43,9 @@ pub fn run() {
                 // waiting a full interval.
                 last_sync_epoch: std::sync::atomic::AtomicI64::new(0),
                 local_transcription_running: std::sync::atomic::AtomicBool::new(false),
+                local_transcription_cancelled: std::sync::Arc::new(
+                    std::sync::atomic::AtomicBool::new(false),
+                ),
                 local_model_download_running: std::sync::atomic::AtomicBool::new(false),
                 local_model_download_cancelled: std::sync::atomic::AtomicBool::new(false),
             });
@@ -97,6 +100,7 @@ pub fn run() {
             commands::delete_local_model,
             commands::delete_local_pipeline,
             commands::transcribe_recording,
+            commands::cancel_local_transcription,
             commands::open_local_transcript,
             commands::read_local_transcript,
         ])

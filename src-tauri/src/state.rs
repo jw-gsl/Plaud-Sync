@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicI64};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::oneshot;
 
@@ -50,6 +50,10 @@ pub struct AppState {
     /// Prevents concurrent local ASR jobs from competing for the model's
     /// memory and CPU. The first MVP intentionally runs one job at a time.
     pub local_transcription_running: AtomicBool,
+    /// Set by `cancel_local_transcription` and polled at checkpoints inside the
+    /// blocking transcription worker. `Arc` so it can be cloned into the
+    /// `spawn_blocking` closure, which requires a `'static` handle.
+    pub local_transcription_cancelled: Arc<AtomicBool>,
     pub local_model_download_running: AtomicBool,
     pub local_model_download_cancelled: AtomicBool,
 }
