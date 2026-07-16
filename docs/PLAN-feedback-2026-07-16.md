@@ -86,7 +86,34 @@ back as "New" on the next sync.
 Build this AFTER the loop fix (it touches storage/settings — the same area the loop
 was reported in) so the whole batch ships and is tested together.
 
+## 4. Auto-transcribe (feature request)
+
+**Report:** auto-download is baked in — does it also auto-transcribe so it's seamless?
+
+**Finding:** No. `auto_sync_loop` only downloads; transcription was manual-only.
+
+### Decision (2026-07-16): add it, default ON, auto-download models once
+- New `auto_transcribe` setting (default **true**), toggle in Settings under Local
+  transcription (only shown when local transcription is enabled).
+- After each auto-sync, `commands::auto_transcribe_new` lists recordings, finds any
+  that are downloaded but not yet transcribed (and not deleted), and transcribes
+  them one at a time (via the existing transcription permit).
+- If the models aren't installed, it downloads them **once** (Parakeet + speaker
+  pipeline) before transcribing.
+- A user cancel stops the whole auto pass (doesn't march to the next recording).
+- Best-effort: network/model failures skip the pass and it retries next tick.
+- Refactored the manual `transcribe_recording` command to delegate to a shared
+  `transcribe_recording_inner(&app, &recording)` reused by the auto pass.
+
+## Status (2026-07-16)
+- [x] Show in folder (row button)
+- [x] Delete recordings (local + resync guard)
+- [x] Auto-transcribe (default on, auto-download models once)
+- [ ] Open/close loop — treated as a likely one-off update-transition issue on the
+      Windows user's machine (reinstall fixed it; no reproducible code path found;
+      updater ruled out). Retest at the next release.
+
 ## Sequencing
-1. Diagnose + fix the loop (blocker). Needs user diagnostics.
-2. Ship loop fix + "Show in folder" together in the next release.
-3. Scope delete separately once local-vs-cloud is decided.
+1. Ship all three built features in the next release; that release also serves as
+   the loop retest for the Windows user.
+2. Revisit the loop only if it recurs on the new version.

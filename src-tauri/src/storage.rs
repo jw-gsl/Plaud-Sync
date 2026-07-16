@@ -29,6 +29,8 @@ pub struct AppSettings {
     pub start_minimized: bool,
     #[serde(default = "default_local_transcription")]
     pub local_transcription: bool,
+    #[serde(default = "default_auto_transcribe")]
+    pub auto_transcribe: bool,
 }
 
 fn default_auto_sync_minutes() -> u32 {
@@ -40,6 +42,10 @@ fn default_theme() -> String {
 }
 
 fn default_local_transcription() -> bool {
+    true
+}
+
+fn default_auto_transcribe() -> bool {
     true
 }
 
@@ -57,6 +63,7 @@ impl Default for AppSettings {
             theme: default_theme(),
             start_minimized: false,
             local_transcription: default_local_transcription(),
+            auto_transcribe: default_auto_transcribe(),
         }
     }
 }

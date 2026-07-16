@@ -28,6 +28,7 @@ export interface AppSettings {
   theme: "system" | "light" | "dark";
   startMinimized: boolean;
   localTranscription: boolean;
+  autoTranscribe: boolean;
 }
 
 export interface LocalModelStatus {

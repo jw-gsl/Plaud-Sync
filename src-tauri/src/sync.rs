@@ -234,11 +234,24 @@ pub async fn auto_sync_loop(app: AppHandle) {
                 // Only announce (and trigger a UI re-list) when something
                 // actually changed — a quiet "nothing new" tick every minute
                 // shouldn't spam the log or refresh the list.
+                let mut changed = false;
                 if result.downloaded > 0 || result.failed > 0 {
                     crate::login_log::info(&format!(
                         "auto-sync: {} downloaded, {} skipped, {} failed",
                         result.downloaded, result.skipped, result.failed
                     ));
+                    changed = true;
+                }
+                // Auto-transcribe newly-downloaded recordings (no-op unless the
+                // setting is on; downloads the models once if missing).
+                let transcribed = crate::commands::auto_transcribe_new(&app).await;
+                if transcribed > 0 {
+                    crate::login_log::info(&format!(
+                        "auto-transcribe: {transcribed} transcribed"
+                    ));
+                    changed = true;
+                }
+                if changed {
                     let _ = app.emit("auto-sync-complete", result);
                 }
             }

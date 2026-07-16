@@ -314,8 +314,19 @@ pub async fn delete_local_model(app: AppHandle, state: State<'_, AppState>) -> R
 pub async fn transcribe_recording(
     app: AppHandle,
     recording: PlaudRecording,
-    state: State<'_, AppState>,
+    _state: State<'_, AppState>,
 ) -> Result<crate::transcription::LocalTranscriptResult, String> {
+    transcribe_recording_inner(&app, &recording).await
+}
+
+/// Core local-transcription routine shared by the manual command and the
+/// auto-transcribe pass. Serializes via the transcription permit, emits progress
+/// events, and runs the blocking pipeline on a worker thread.
+pub(crate) async fn transcribe_recording_inner(
+    app: &AppHandle,
+    recording: &PlaudRecording,
+) -> Result<crate::transcription::LocalTranscriptResult, String> {
+    let state = app.state::<AppState>();
     if state
         .local_transcription_running
         .swap(true, std::sync::atomic::Ordering::AcqRel)
@@ -345,7 +356,7 @@ pub async fn transcribe_recording(
     }
 
     let root = std::path::PathBuf::from(&settings.download_dir);
-    let base = crate::sync::build_audio_path(&root, &recording, &settings);
+    let base = crate::sync::build_audio_path(&root, recording, &settings);
     let audio_path = [base.clone(), base.with_extension("opus")]
         .into_iter()
         .find(|path| path.is_file())
@@ -411,6 +422,102 @@ pub fn cancel_local_transcription(state: State<'_, AppState>) -> Result<(), Stri
             .store(true, std::sync::atomic::Ordering::Release);
     }
     Ok(())
+}
+
+/// Background auto-transcribe pass: after auto-sync downloads recordings,
+/// transcribe any that are downloaded but not yet transcribed (and not deleted).
+/// Downloads the local models once if they're missing. Runs one recording at a
+/// time (via the transcription permit) and returns how many were transcribed.
+/// Best-effort — network/model failures skip the pass and it retries next tick.
+pub(crate) async fn auto_transcribe_new(app: &AppHandle) -> usize {
+    use std::sync::atomic::Ordering;
+
+    let state = app.state::<AppState>();
+    let (storage, settings) = {
+        let Ok(guard) = state.storage.lock() else {
+            return 0;
+        };
+        (guard.clone(), guard.get_settings())
+    };
+    if !settings.auto_transcribe || !settings.local_transcription {
+        return 0;
+    }
+
+    // Fresh list from Plaud so newly-downloaded recordings are included.
+    let mut client = PlaudClient::new(PlaudAuth::new(storage.clone()), storage.get_region());
+    let Ok(recordings) = client.list_recordings().await else {
+        return 0;
+    };
+    let deleted = storage.get_deleted_ids();
+    let root = std::path::PathBuf::from(&settings.download_dir);
+    let pending: Vec<PlaudRecording> = recordings
+        .into_iter()
+        .filter(|r| {
+            if deleted.contains(&r.id) {
+                return false;
+            }
+            let base = crate::sync::build_audio_path(&root, r, &settings);
+            let downloaded = base.exists() || base.with_extension("opus").exists();
+            let transcribed = base.with_extension("local.txt").exists();
+            downloaded && !transcribed
+        })
+        .collect();
+    if pending.is_empty() {
+        return 0;
+    }
+
+    // Ensure the models are installed, downloading once if missing.
+    let Ok(app_data) = app.path().app_data_dir() else {
+        return 0;
+    };
+    let need_model = !crate::transcription::model_store::is_model_ready(&app_data);
+    let need_pipeline = crate::transcription::model_store::pipeline_model_paths(&app_data).is_none();
+    if need_model || need_pipeline {
+        if state
+            .local_model_download_running
+            .swap(true, Ordering::AcqRel)
+        {
+            return 0; // a manual download is already running; retry next tick
+        }
+        let _permit = ModelDownloadPermit(&state.local_model_download_running);
+        state
+            .local_model_download_cancelled
+            .store(false, Ordering::Release);
+        if need_model
+            && crate::transcription::model_store::download_model(
+                app,
+                &state.local_model_download_cancelled,
+            )
+            .await
+            .is_err()
+        {
+            return 0;
+        }
+        if need_pipeline
+            && crate::transcription::model_store::download_pipeline_model(
+                app,
+                &state.local_model_download_cancelled,
+            )
+            .await
+            .is_err()
+        {
+            return 0;
+        }
+    }
+
+    let mut transcribed = 0usize;
+    for recording in pending {
+        match transcribe_recording_inner(app, &recording).await {
+            Ok(_) => transcribed += 1,
+            // A user cancel stops the whole auto pass (don't march on to the next).
+            Err(e) if e.to_lowercase().contains("cancel") => break,
+            Err(e) => crate::login_log::warn(&format!(
+                "auto-transcribe failed for \"{}\": {e}",
+                recording.filename
+            )),
+        }
+    }
+    transcribed
 }
 
 #[tauri::command]
