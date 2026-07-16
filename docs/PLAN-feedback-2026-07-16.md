@@ -60,10 +60,31 @@ the released 0.4.0 download.
   network calls). Destructive, so it needs a confirm dialog and clear "local vs
   cloud" wording.
 
-### Open question for the user
-- Delete **local downloads only**, **from Plaud cloud**, or **both**? Changes scope
-  and risk. Defaulting to a plan for local-only + optional cloud once the endpoint
-  is confirmed.
+### Decision (2026-07-16): local-only, with a persistent resync guard
+Delete the **local files only** — do NOT touch the Plaud cloud / API. But the ID
+must be remembered as "dismissed" so a resync (manual or auto) does not re-list or
+re-download it. Deleting the file alone is not enough; without the guard it comes
+back as "New" on the next sync.
+
+### Design
+- **Storage:** add `deleted_recording_ids: Vec<String>` to `StoredConfig`
+  (`storage.rs`), with `get_deleted_ids()` / `add_deleted_id(id)` (+ persist).
+- **Command `delete_local_recording(recording)`:** remove the audio file(s)
+  (`base` + `.opus`) and the `.local.txt` / `.local.json`, then add the ID to the
+  deleted set and save.
+- **List guard:** `list_recordings` (and the cached-list command) filter out any ID
+  in the deleted set, so it never reappears in the UI list.
+- **Auto-sync guard:** the auto-sync / download-new path must also skip deleted IDs
+  so it doesn't silently re-download in the background.
+- **UI:** a Delete action on downloaded rows behind a confirm dialog; wording makes
+  clear it removes the local copy only (the recording stays in the Plaud account,
+  but Plaud Sync won't re-download it).
+- **Optional later:** a way to "un-dismiss" (clear the deleted set) if a user wants
+  it back — not required for v1.
+
+### Sequencing note
+Build this AFTER the loop fix (it touches storage/settings — the same area the loop
+was reported in) so the whole batch ships and is tested together.
 
 ## Sequencing
 1. Diagnose + fix the loop (blocker). Needs user diagnostics.
