@@ -103,6 +103,7 @@ pub fn run() {
             commands::cancel_local_transcription,
             commands::open_local_transcript,
             commands::read_local_transcript,
+            commands::delete_local_recording,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

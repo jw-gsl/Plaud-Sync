@@ -53,6 +53,8 @@
   // The recording the transcript dialog is showing, so it can be retranscribed
   // in place without closing the dialog.
   let transcriptRecording = $state<Recording | null>(null);
+  // The recording awaiting a delete confirmation, if any.
+  let pendingDelete = $state<Recording | null>(null);
 
   let lastSynced = $state<number | null>(null);
   let syncInfo = $state<SyncInfo | null>(null);
@@ -308,6 +310,22 @@
       // Cancel whichever phase is active — model download or transcription.
       if (downloadingModels) await api.cancelLocalModelDownload();
       await api.cancelLocalTranscription();
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  // Delete a downloaded recording's local files and remember it so a resync
+  // doesn't re-download it. Confirmed via the modal; does not touch Plaud.
+  async function confirmDelete() {
+    const rec = pendingDelete;
+    if (!rec) return;
+    pendingDelete = null;
+    error = "";
+    try {
+      await api.deleteLocalRecording(rec);
+      status = `Deleted "${rec.filename}" from this computer`;
+      await refreshList();
     } catch (e) {
       error = String(e);
     }
@@ -578,6 +596,18 @@
                 Transcribe
               </button>
             {/if}
+            {#if localTranscribing !== recording.id}
+              <button
+                class="btn btn-ghost btn-sm transcribe-btn delete-btn"
+                onclick={(event) => {
+                  event.stopPropagation();
+                  pendingDelete = recording;
+                }}
+                title="Delete this recording from this computer"
+              >
+                Delete
+              </button>
+            {/if}
           </div>
         {:else}
           <div class="rec-row" title="Not downloaded yet">
@@ -684,6 +714,35 @@
       {:else}
         <pre class="transcript-view">{transcriptText}</pre>
       {/if}
+    </div>
+  </div>
+{/if}
+
+{#if pendingDelete}
+  <div class="transcript-backdrop" role="presentation" onclick={() => (pendingDelete = null)}>
+    <div
+      class="confirm-dialog"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Delete recording"
+      tabindex="-1"
+      onclick={(event) => event.stopPropagation()}
+      onkeydown={(event) => {
+        if (event.key === "Escape") pendingDelete = null;
+      }}
+    >
+      <h3>Delete this recording?</h3>
+      <p class="meta">
+        Removes the downloaded audio and transcript for “{pendingDelete.filename}” from this
+        computer. The recording stays in your Plaud account, but Plaud Sync won’t download it
+        again.
+      </p>
+      <div class="confirm-actions">
+        <button class="btn btn-ghost btn-sm" onclick={() => (pendingDelete = null)}>Cancel</button>
+        <button class="btn btn-primary btn-sm" onclick={() => void confirmDelete()}>
+          Delete from this computer
+        </button>
+      </div>
     </div>
   </div>
 {/if}
@@ -866,6 +925,27 @@
     border-radius: 12px;
     background: var(--surface);
     box-shadow: 0 18px 60px rgba(0, 0, 0, 0.35);
+  }
+  .confirm-dialog {
+    width: min(440px, 100%);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 20px;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--surface);
+    box-shadow: 0 18px 60px rgba(0, 0, 0, 0.35);
+  }
+  .confirm-dialog h3 {
+    margin: 0;
+    font-size: 1rem;
+  }
+  .confirm-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 6px;
   }
   .transcript-header {
     display: flex;

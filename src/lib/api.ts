@@ -51,4 +51,6 @@ export const api = {
     invoke<void>("open_local_transcript", { recording }),
   readLocalTranscript: (recording: Recording) =>
     invoke<string>("read_local_transcript", { recording }),
+  deleteLocalRecording: (recording: Recording) =>
+    invoke<void>("delete_local_recording", { recording }),
 };

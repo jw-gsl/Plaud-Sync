@@ -75,6 +75,11 @@ struct StoredConfig {
     // token already lives in this file, so this is no extra exposure.
     #[serde(default)]
     refresh_token: Option<String>,
+    // Recordings the user deleted locally. Kept so a resync (manual or auto)
+    // does not re-list or re-download them — deleting the file alone isn't
+    // enough, since the recording still exists in the Plaud account.
+    #[serde(default)]
+    deleted_recording_ids: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -159,6 +164,20 @@ impl Storage {
     pub fn save_display_name(&self, name: &str) -> Result<(), std::io::Error> {
         let mut config = self.load();
         config.display_name = Some(name.to_string());
+        self.save(&config)
+    }
+
+    /// Recording ids the user deleted locally; excluded from the list and from
+    /// re-download on sync.
+    pub fn get_deleted_ids(&self) -> Vec<String> {
+        self.load().deleted_recording_ids
+    }
+
+    pub fn add_deleted_id(&self, id: &str) -> Result<(), std::io::Error> {
+        let mut config = self.load();
+        if !config.deleted_recording_ids.iter().any(|x| x == id) {
+            config.deleted_recording_ids.push(id.to_string());
+        }
         self.save(&config)
     }
 

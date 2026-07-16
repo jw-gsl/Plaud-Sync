@@ -141,6 +141,9 @@ pub async fn list_recordings(state: State<'_, AppState>) -> Result<Vec<PlaudReco
     let mut recordings = client.list_recordings().await?;
     mark_downloaded_status(&mut recordings, &settings);
     mark_local_transcript_status(&mut recordings, &settings);
+    // Hide locally-deleted recordings so they don't reappear after a resync.
+    let deleted = storage.get_deleted_ids();
+    recordings.retain(|r| !deleted.contains(&r.id));
     // Cache the fresh list so the UI can render instantly next time / offline.
     let _ = storage.save_recordings_cache(&recordings);
     Ok(recordings)
@@ -155,6 +158,8 @@ pub fn get_cached_recordings(state: State<'_, AppState>) -> Result<Vec<PlaudReco
     let mut recordings = storage.get_recordings_cache();
     mark_downloaded_status(&mut recordings, &settings);
     mark_local_transcript_status(&mut recordings, &settings);
+    let deleted = storage.get_deleted_ids();
+    recordings.retain(|r| !deleted.contains(&r.id));
     Ok(recordings)
 }
 
@@ -448,6 +453,38 @@ pub fn read_local_transcript(
     let transcript = audio.with_extension("local.txt");
     std::fs::read_to_string(&transcript)
         .map_err(|e| format!("Could not read local transcript: {e}"))
+}
+
+/// Delete a recording's local files (audio + transcript/info + local-transcript
+/// outputs) and remember its id so a resync (manual or auto) does not re-list or
+/// re-download it. Does NOT touch the recording in the Plaud account.
+#[tauri::command]
+pub fn delete_local_recording(
+    recording: PlaudRecording,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let storage = state.storage.lock().map_err(|e| e.to_string())?;
+    let settings = storage.get_settings();
+    let root = std::path::PathBuf::from(&settings.download_dir);
+    let base = crate::sync::build_audio_path(&root, &recording, &settings);
+    // Remove every file a download or local transcription may have produced.
+    for path in [
+        base.clone(),
+        base.with_extension("opus"),
+        base.with_extension("txt"),
+        base.with_extension("local.txt"),
+        base.with_extension("local.json"),
+    ] {
+        if path.is_file() {
+            std::fs::remove_file(&path)
+                .map_err(|e| format!("Could not delete {}: {e}", path.display()))?;
+        }
+    }
+    // Remember it even if no files were present, so it stays out of the list.
+    storage
+        .add_deleted_id(&recording.id)
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 struct TranscriptionPermit<'a>(&'a std::sync::atomic::AtomicBool);
