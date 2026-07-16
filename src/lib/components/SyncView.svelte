@@ -548,11 +548,11 @@
                 class="btn btn-ghost btn-sm transcribe-btn"
                 onclick={(event) => {
                   event.stopPropagation();
-                  void api.openLocalTranscript(recording);
+                  void api.revealRecording(recording);
                 }}
-                title="Open the transcript file"
+                title="Show the recording and transcript in Finder"
               >
-                Open file
+                Show in folder
               </button>
             {:else if localTranscribing === recording.id}
               <button
