@@ -162,6 +162,8 @@
         name={auth.name ?? auth.email}
         onOpenSettings={() => (view = "settings")}
         onLogout={handleLogout}
+        onCheckUpdates={() => checkUpdates(true)}
+        updateStatus={update}
       />
     {/if}
   </main>
