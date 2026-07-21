@@ -7,6 +7,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The app updates itself from the rolling `plaud-sync-latest` GitHub release; the
 notes for each published version are taken from this file.
 
+## [0.4.1] - 2026-07-21
+
+### Added
+- **Auto-transcribe new downloads** (on by default). Recordings are transcribed
+  automatically as they download — including during background auto-sync — so
+  transcripts are ready without a click. The local models download once if they
+  aren't installed yet. Turn it off in Settings → Local transcription.
+- **Delete recordings.** A Delete action on downloaded recordings removes the
+  local audio and transcript from your computer. The recording stays in your
+  Plaud account, but Plaud Sync remembers it and won't re-download it on the next
+  sync.
+
+### Changed
+- The transcript row's "Open file" button is now **Show in folder**, which reveals
+  the recording and transcript in Finder. The in-app transcript viewer still has
+  Open file (and Open folder).
+
 ## [0.4.0] - 2026-07-14
 
 ### Added
