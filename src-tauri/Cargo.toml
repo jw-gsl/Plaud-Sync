@@ -1,6 +1,6 @@
 [package]
 name = "plaud-sync"
-version = "0.4.0"
+version = "0.4.1"
 description = "Download Plaud recordings locally"
 authors = ["James Whiting"]
 edition = "2021"

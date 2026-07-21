@@ -37,6 +37,12 @@ pub async fn sync_recordings(
 ) -> Result<SyncResult, String> {
     let mut client = PlaudClient::new(PlaudAuth::new(storage.clone()), storage.get_region());
     let recordings = client.list_recordings().await?;
+    // Never re-download recordings the user deleted locally.
+    let deleted = storage.get_deleted_ids();
+    let recordings: Vec<PlaudRecording> = recordings
+        .into_iter()
+        .filter(|r| !deleted.contains(&r.id))
+        .collect();
     download_list(app, &mut client, &recordings, settings).await
 }
 
@@ -49,9 +55,10 @@ pub async fn download_selected(
 ) -> Result<SyncResult, String> {
     let mut client = PlaudClient::new(PlaudAuth::new(storage.clone()), storage.get_region());
     let all = client.list_recordings().await?;
+    let deleted = storage.get_deleted_ids();
     let subset: Vec<PlaudRecording> = all
         .into_iter()
-        .filter(|r| ids.iter().any(|id| id == &r.id))
+        .filter(|r| ids.iter().any(|id| id == &r.id) && !deleted.contains(&r.id))
         .collect();
     download_list(app, &mut client, &subset, settings).await
 }
@@ -227,11 +234,24 @@ pub async fn auto_sync_loop(app: AppHandle) {
                 // Only announce (and trigger a UI re-list) when something
                 // actually changed — a quiet "nothing new" tick every minute
                 // shouldn't spam the log or refresh the list.
+                let mut changed = false;
                 if result.downloaded > 0 || result.failed > 0 {
                     crate::login_log::info(&format!(
                         "auto-sync: {} downloaded, {} skipped, {} failed",
                         result.downloaded, result.skipped, result.failed
                     ));
+                    changed = true;
+                }
+                // Auto-transcribe newly-downloaded recordings (no-op unless the
+                // setting is on; downloads the models once if missing).
+                let transcribed = crate::commands::auto_transcribe_new(&app).await;
+                if transcribed > 0 {
+                    crate::login_log::info(&format!(
+                        "auto-transcribe: {transcribed} transcribed"
+                    ));
+                    changed = true;
+                }
+                if changed {
                     let _ = app.emit("auto-sync-complete", result);
                 }
             }

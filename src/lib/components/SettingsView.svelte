@@ -32,6 +32,7 @@
     theme: "system",
     startMinimized: false,
     localTranscription: true,
+    autoTranscribe: true,
   });
   let autostart = $state(false);
   let modelStatus = $state<LocalModelStatus | null>(null);
@@ -268,6 +269,19 @@
       </div>
       <input type="checkbox" bind:checked={settings.localTranscription} />
     </div>
+    {#if settings.localTranscription}
+      <div class="toggle-row">
+        <div>
+          <strong>Auto-transcribe new downloads</strong>
+          <div class="meta">
+            Automatically transcribe recordings as they download (including during
+            auto-sync), so transcripts are ready without a click. Uses your CPU for a few
+            minutes per recording; the models download once if they aren't installed yet.
+          </div>
+        </div>
+        <input type="checkbox" bind:checked={settings.autoTranscribe} />
+      </div>
+    {/if}
     <div class="model-row">
       <div class="model-state">
         {#if downloading}
