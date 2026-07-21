@@ -12,17 +12,26 @@
     SyncProgress,
     SyncResult,
   } from "../types";
+  import type { UpdateStatus } from "../updater";
   import { formatDate, formatDuration } from "../utils";
 
   let {
     onOpenSettings,
     onLogout,
     name,
+    onCheckUpdates,
+    updateStatus,
   }: {
     onOpenSettings: () => void;
     onLogout: () => void;
     name?: string;
+    onCheckUpdates: () => void;
+    updateStatus: UpdateStatus;
   } = $props();
+
+  const checkingUpdate = $derived(
+    updateStatus.kind === "checking" || updateStatus.kind === "downloading",
+  );
 
   type Filter = "all" | "new" | "downloaded";
 
@@ -437,6 +446,14 @@
       {#if name}<span class="who-sub">{name}</span>{/if}
     </div>
     <div class="nav-actions">
+      <button
+        class="btn btn-ghost btn-sm"
+        onclick={onCheckUpdates}
+        disabled={checkingUpdate}
+        title="Check for a new version of Plaud Sync"
+      >
+        {checkingUpdate ? "Checking…" : "Check for updates"}
+      </button>
       <button class="btn btn-secondary btn-sm" onclick={onOpenSettings}>Settings</button>
       <button class="btn btn-ghost btn-sm" onclick={onLogout}>Sign out</button>
     </div>

@@ -7,6 +7,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The app updates itself from the rolling `plaud-sync-latest` GitHub release; the
 notes for each published version are taken from this file.
 
+## [0.4.2] - 2026-07-21
+
+### Added
+- A **Check for updates** button on the main Recordings screen, next to Settings,
+  so you can check without opening Settings or clicking the version number.
+
 ## [0.4.1] - 2026-07-21
 
 ### Added
