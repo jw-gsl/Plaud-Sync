@@ -6,6 +6,13 @@ use super::types::{
     PlaudUserInfo,
 };
 
+/// Maximum number of region redirects to follow for a single request. A
+/// well-behaved account settles in one hop (us→eu, say). More than this means
+/// Plaud is bouncing the account between regions; we stop rather than follow it
+/// forever — the previous unbounded recursion overflowed the stack (a
+/// deterministic crash-loop for affected accounts).
+const MAX_REGION_REDIRECTS: u8 = 3;
+
 pub struct PlaudClient {
     auth: PlaudAuth,
     region: String,
@@ -38,43 +45,60 @@ impl PlaudClient {
     }
 
     async fn request(&mut self, path: &str) -> Result<Value, String> {
-        let url = format!("{}{}", self.base_url(), path);
-        let token = self.auth.get_token().await?;
-        let mut res = self.send_get(&url, &token).await?;
+        // Follow region redirects in a bounded loop rather than recursing, so a
+        // server that bounces an account between regions cannot recurse forever
+        // and overflow the stack.
+        let mut redirects = 0u8;
+        loop {
+            let url = format!("{}{}", self.base_url(), path);
+            let token = self.auth.get_token().await?;
+            let mut res = self.send_get(&url, &token).await?;
 
-        // A token can be rejected before its `exp` (revocation, clock drift, or
-        // a refresh token we never managed to use). Force a renewal and retry
-        // once rather than failing the whole sync.
-        if res.status() == reqwest::StatusCode::UNAUTHORIZED {
-            crate::login_log::info("got 401 from API — forcing token refresh and retrying once");
-            let token = self.auth.force_refresh().await?;
-            res = self.send_get(&url, &token).await?;
-        }
+            // A token can be rejected before its `exp` (revocation, clock drift,
+            // or a refresh token we never managed to use). Force a renewal and
+            // retry once rather than failing the whole sync.
+            if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+                crate::login_log::info(
+                    "got 401 from API — forcing token refresh and retrying once",
+                );
+                let token = self.auth.force_refresh().await?;
+                res = self.send_get(&url, &token).await?;
+            }
 
-        if !res.status().is_success() {
-            return Err(format!("Plaud API error: {}", res.status()));
-        }
+            if !res.status().is_success() {
+                return Err(format!("Plaud API error: {}", res.status()));
+            }
 
-        let data: Value = res
-            .json()
-            .await
-            .map_err(|e| format!("Invalid API response: {e}"))?;
+            let data: Value = res
+                .json()
+                .await
+                .map_err(|e| format!("Invalid API response: {e}"))?;
 
-        if data.get("status").and_then(|s| s.as_i64()) == Some(-302) {
-            if let Some(domain) = data.pointer("/data/domains/api").and_then(|d| d.as_str()) {
-                // Trust the host Plaud points us at (validated to a plaud.ai
-                // host). Only retry if it actually changes our base URL, so a
-                // redirect that resolves to the same host can't loop forever.
-                if let Some(region) = region_from_redirect(domain) {
-                    if base_url(&region) != self.base_url() {
+            if data.get("status").and_then(|s| s.as_i64()) == Some(-302) {
+                if let Some(region) = data
+                    .pointer("/data/domains/api")
+                    .and_then(|d| d.as_str())
+                    // Trust the host Plaud points us at (validated to a plaud.ai
+                    // host). Only follow it if it actually changes our base URL,
+                    // so a redirect that resolves to the same host can't loop.
+                    .and_then(region_from_redirect)
+                    .filter(|region| base_url(region) != self.base_url())
+                {
+                    if redirects < MAX_REGION_REDIRECTS {
+                        redirects += 1;
                         self.region = region;
-                        return Box::pin(self.request(path)).await;
+                        continue;
                     }
+                    // Bounced too many times — stop following and surface the
+                    // last response rather than looping until the stack blows.
+                    crate::login_log::warn(
+                        "Plaud region redirect did not settle after several hops — giving up",
+                    );
                 }
             }
-        }
 
-        Ok(data)
+            return Ok(data);
+        }
     }
 
     pub async fn list_recordings(&mut self) -> Result<Vec<PlaudRecording>, String> {
