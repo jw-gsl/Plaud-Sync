@@ -7,6 +7,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The app updates itself from the rolling `plaud-sync-latest` GitHub release; the
 notes for each published version are taken from this file.
 
+## [0.4.3] - 2026-07-22
+
+### Fixed
+- Fixed a crash loop (the app repeatedly opening and closing) that could affect
+  accounts whose region the Plaud API bounces between servers. The app now
+  follows region redirects a bounded number of times instead of retrying
+  forever, which previously overflowed the stack and crashed on startup.
+
 ## [0.4.2] - 2026-07-21
 
 ### Added
