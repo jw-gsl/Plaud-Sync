@@ -7,6 +7,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The app updates itself from the rolling `plaud-sync-latest` GitHub release; the
 notes for each published version are taken from this file.
 
+## [0.4.4] - 2026-08-17
+
+### Fixed
+- Region redirects now fail cleanly when Plaud cycles between API hosts or
+  exceeds the redirect limit, instead of returning a misleading success response.
+- Added regression coverage for redirect cycles and redirect-limit handling.
+
 ## [0.4.3] - 2026-07-22
 
 ### Fixed
