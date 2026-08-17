@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use serde_json::Value;
 
 use super::auth::PlaudAuth;
@@ -49,6 +51,7 @@ impl PlaudClient {
         // server that bounces an account between regions cannot recurse forever
         // and overflow the stack.
         let mut redirects = 0u8;
+        let mut visited_bases = HashSet::from([self.base_url()]);
         loop {
             let url = format!("{}{}", self.base_url(), path);
             let token = self.auth.get_token().await?;
@@ -75,25 +78,23 @@ impl PlaudClient {
                 .map_err(|e| format!("Invalid API response: {e}"))?;
 
             if data.get("status").and_then(|s| s.as_i64()) == Some(-302) {
-                if let Some(region) = data
-                    .pointer("/data/domains/api")
-                    .and_then(|d| d.as_str())
-                    // Trust the host Plaud points us at (validated to a plaud.ai
-                    // host). Only follow it if it actually changes our base URL,
-                    // so a redirect that resolves to the same host can't loop.
-                    .and_then(region_from_redirect)
-                    .filter(|region| base_url(region) != self.base_url())
-                {
-                    if redirects < MAX_REGION_REDIRECTS {
-                        redirects += 1;
-                        self.region = region;
-                        continue;
+                if let Some(domain) = data.pointer("/data/domains/api").and_then(|d| d.as_str()) {
+                    match next_region_redirect(
+                        &self.region,
+                        domain,
+                        &mut redirects,
+                        &mut visited_bases,
+                    ) {
+                        Ok(Some(region)) => {
+                            self.region = region;
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            crate::login_log::error(&e);
+                            return Err(e);
+                        }
                     }
-                    // Bounced too many times — stop following and surface the
-                    // last response rather than looping until the stack blows.
-                    crate::login_log::warn(
-                        "Plaud region redirect did not settle after several hops — giving up",
-                    );
                 }
             }
 
@@ -254,6 +255,41 @@ impl PlaudClient {
     }
 }
 
+/// Decide whether an in-body Plaud region redirect can be followed safely.
+///
+/// This is deliberately separate from the HTTP request so the loop and cycle
+/// guards can be tested without making live API calls.
+fn next_region_redirect(
+    current_region: &str,
+    domain: &str,
+    redirects: &mut u8,
+    visited_bases: &mut HashSet<String>,
+) -> Result<Option<String>, String> {
+    let Some(region) = region_from_redirect(domain) else {
+        return Ok(None);
+    };
+
+    let current_base = base_url(current_region);
+    let next_base = base_url(&region);
+    if next_base == current_base {
+        return Ok(None);
+    }
+
+    if *redirects >= MAX_REGION_REDIRECTS {
+        return Err(format!(
+            "Plaud API region redirect limit exceeded after {MAX_REGION_REDIRECTS} hops"
+        ));
+    }
+    if !visited_bases.insert(next_base) {
+        return Err(
+            "Plaud API region redirect loop detected; refusing to retry indefinitely".into(),
+        );
+    }
+
+    *redirects += 1;
+    Ok(Some(region))
+}
+
 fn parse_recording(item: &Value) -> Option<PlaudRecording> {
     let id = item
         .get("id")
@@ -285,4 +321,46 @@ fn parse_recording(item: &Value) -> Option<PlaudRecording> {
         downloaded: false,
         local_transcript: false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn region_redirect_cycle_fails_before_retrying_forever() {
+        let mut redirects = 0;
+        let mut visited = HashSet::from([base_url("us")]);
+
+        assert_eq!(
+            next_region_redirect(
+                "us",
+                "https://api-euc1.plaud.ai",
+                &mut redirects,
+                &mut visited,
+            )
+            .unwrap(),
+            Some("eu".to_string())
+        );
+
+        let error =
+            next_region_redirect("eu", "https://api.plaud.ai", &mut redirects, &mut visited)
+                .expect_err("a us → eu → us cycle must be rejected");
+        assert!(error.contains("redirect loop"));
+    }
+
+    #[test]
+    fn region_redirect_limit_fails_cleanly() {
+        let mut redirects = MAX_REGION_REDIRECTS;
+        let mut visited = HashSet::from([base_url("us")]);
+
+        let error = next_region_redirect(
+            "us",
+            "https://api-euc1.plaud.ai",
+            &mut redirects,
+            &mut visited,
+        )
+        .expect_err("redirects beyond the limit must be rejected");
+        assert!(error.contains("redirect limit"));
+    }
 }
