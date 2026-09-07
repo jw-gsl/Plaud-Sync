@@ -218,11 +218,10 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
   # tauri-action uploads the new bundles and refreshes latest.json, but it does
-  # NOT overwrite the title/body of a pre-existing rolling release, and it leaves
-  # every prior version's installers attached. This job runs once after both
-  # platforms finish to: (1) set the release title + notes to the shipped
-  # version (notes taken from CHANGELOG.md), and (2) delete stale assets so the
-  # release only shows the current version's files plus latest.json.
+  # NOT overwrite the published_at timestamp of a pre-existing rolling release,
+  # and it leaves every prior version's installers attached. This job runs once
+  # after both platforms finish to prune stale assets, then recreate the rolling
+  # release so GitHub records the actual release date for this version.
   finalize:
     needs: build
     runs-on: ubuntu-latest
@@ -231,7 +230,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Update release title/notes and prune old assets
+      - name: Recreate rolling release with current date and assets
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -249,11 +248,6 @@ jobs:
           ' CHANGELOG.md | awk 'NF{last=NR} {line[NR]=$0} END{first=1; while(first<=last && line[first]=="") first++; for(i=first;i<=last;i++) print line[i]}')
           if [ -z "$NOTES" ]; then NOTES="See CHANGELOG.md for details."; fi
           BODY=$(printf '%s\n\n%s\n' "$NOTES" 'New install: download the `.dmg` (macOS) or `-setup.exe` (Windows) below.')
-
-          gh release edit plaud-sync-latest \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "Plaud Sync v$VERSION" \
-            --notes "$BODY"
 
           # Keep latest.json, this version's installers, and the macOS updater
           # bundle. NOTE: the macOS updater target (Plaud.Sync_aarch64.app.tar.gz,
@@ -273,3 +267,25 @@ jobs:
                 ;;
             esac
           done
+
+          # GitHub does not allow published_at to be edited. Archive the pruned
+          # assets, delete the old rolling release/tag, and recreate it so the
+          # release page's published date reflects this release.
+          ASSET_DIR="$RUNNER_TEMP/plaud-sync-release-assets"
+          rm -rf "$ASSET_DIR"
+          mkdir -p "$ASSET_DIR"
+          gh release download plaud-sync-latest \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$ASSET_DIR"
+
+          gh release delete plaud-sync-latest \
+            --repo "$GITHUB_REPOSITORY" \
+            --yes \
+            --cleanup-tag
+
+          gh release create plaud-sync-latest \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Plaud Sync v$VERSION" \
+            --notes "$BODY" \
+            "$ASSET_DIR"/*

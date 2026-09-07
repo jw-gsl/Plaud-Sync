@@ -7,6 +7,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The app updates itself from the rolling `plaud-sync-latest` GitHub release; the
 notes for each published version are taken from this file.
 
+## [0.4.6] - 2026-09-07
+
+### Fixed
+- Added explicit Windows installer lifecycle logging at
+  `%TEMP%\\Plaud-Sync-installer.log`.
+- Windows install and uninstall hooks now stop any running Plaud Sync process
+  before replacing or removing the application files.
+- Rolling GitHub releases are recreated after publishing so their displayed
+  release date reflects the current release.
+
 ## [0.4.5] - 2026-09-07
 
 ### Changed
