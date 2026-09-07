@@ -7,6 +7,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The app updates itself from the rolling `plaud-sync-latest` GitHub release; the
 notes for each published version are taken from this file.
 
+## [0.4.5] - 2026-09-07
+
+### Changed
+- Windows NSIS installs are explicitly per-machine, with the default path
+  `C:\\Program Files\\Plaud Sync` and a consistent Start menu folder.
+
 ## [0.4.4] - 2026-08-17
 
 ### Fixed
