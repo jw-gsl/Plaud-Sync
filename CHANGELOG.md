@@ -7,6 +7,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The app updates itself from the rolling `plaud-sync-latest` GitHub release; the
 notes for each published version are taken from this file.
 
+## [0.4.7] - 2026-09-10
+
+### Fixed
+- Google login now passes the GIS ID token from the OAuth popup back to the
+  app, so closing the browser window no longer discards a successful login.
+
 ## [0.4.6] - 2026-09-07
 
 ### Fixed

@@ -152,6 +152,32 @@ const TOKEN_WATCHER_SCRIPT: &str = r#"
     return looksLikeJwt(candidate) ? candidate : null;
   }
 
+  function isGoogleMessageOrigin(origin) {
+    try {
+      const host = new URL(origin || "").hostname.toLowerCase();
+      return host === "google.com" || host.endsWith(".google.com")
+        || host === "google.co.uk" || host.endsWith(".google.co.uk")
+        || host === "googleusercontent.com" || host.endsWith(".googleusercontent.com");
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // GIS normally delivers the credential by posting it from the OAuth popup
+  // to the opener.  The popup is created by WebView2's default implementation,
+  // so this watcher is installed in the main login webview rather than in that
+  // popup.  Receiving the message here lets the native side exchange the
+  // Google ID token directly, even when the Plaud SPA never gets a chance to
+  // process the opener callback itself.
+  window.addEventListener("message", function (event) {
+    if (!isGoogleMessageOrigin(event.origin)) return;
+    const idToken = idTokenFromGisData(event.data);
+    if (idToken) {
+      plog("got id_token from Google popup message");
+      finishSso(idToken, detectedRegion);
+    }
+  }, true);
+
   function updateRegionFromUrl(url) {
     const text = String(url || "");
     if (text.includes("api-euc1") || text.includes("euc1")) detectedRegion = "eu";
