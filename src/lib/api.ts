@@ -34,6 +34,7 @@ export const api = {
   pickDownloadFolder: () => invoke<string | null>("pick_download_folder"),
   openDownloadFolder: () => invoke<void>("open_download_folder"),
   openLoginDebugLog: () => invoke<void>("open_login_debug_log"),
+  logClientError: (message: string) => invoke<void>("log_client_error", { message }),
   revealRecording: (recording: Recording) =>
     invoke<void>("reveal_recording", { recording }),
   getSyncInfo: () => invoke<SyncInfo>("get_sync_info"),
