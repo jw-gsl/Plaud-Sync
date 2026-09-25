@@ -23,3 +23,6 @@ vite.config.ts.timestamp-*
 
 # build-installer.sh output (binaries; CI rebuilds these)
 /dist/
+
+# Windows crash dumps (local diagnostics only)
+/crash_dumps/
