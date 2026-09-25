@@ -39,10 +39,16 @@ pub async fn sync_recordings(
     let recordings = client.list_recordings().await?;
     // Never re-download recordings the user deleted locally.
     let deleted = storage.get_deleted_ids();
+    let listed = recordings.len();
     let recordings: Vec<PlaudRecording> = recordings
         .into_iter()
         .filter(|r| !deleted.contains(&r.id))
         .collect();
+    crate::login_log::debug(&format!(
+        "sync: listed {listed} recordings, {} after excluding {} locally deleted",
+        recordings.len(),
+        listed - recordings.len()
+    ));
     download_list(app, &mut client, &recordings, settings).await
 }
 
@@ -93,7 +99,20 @@ async fn download_list(
 
         // `build_audio_path` returns a `.mp3` base; the file may end up `.opus`.
         let audio_path = build_audio_path(&download_root, recording, settings);
-        if audio_path.exists() || audio_path.with_extension("opus").exists() {
+        let on_disk = [
+            audio_path.clone(),
+            audio_path.with_extension("mp3"),
+            audio_path.with_extension("opus"),
+        ]
+        .into_iter()
+        .find(|p| p.exists());
+        if let Some(existing) = on_disk {
+            crate::login_log::debug(&format!(
+                "skip \"{}\" (id {}): already on disk at {}",
+                recording.filename,
+                recording.id,
+                existing.display()
+            ));
             skipped += 1;
             continue;
         }
@@ -109,7 +128,15 @@ async fn download_list(
         );
 
         match download_one(client, recording, settings, &audio_path).await {
-            Ok(()) => downloaded += 1,
+            Ok(final_path) => {
+                crate::login_log::info(&format!(
+                    "downloaded \"{}\" (id {}) -> {}",
+                    recording.filename,
+                    recording.id,
+                    final_path.display()
+                ));
+                downloaded += 1;
+            }
             Err(e) => {
                 failed += 1;
                 crate::login_log::warn(&format!(
@@ -146,7 +173,7 @@ async fn download_one(
     recording: &PlaudRecording,
     settings: &AppSettings,
     audio_path: &Path,
-) -> Result<(), String> {
+) -> Result<PathBuf, String> {
     if let Some(parent) = audio_path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -161,7 +188,12 @@ async fn download_one(
 
     if settings.download_transcript && recording.is_trans {
         let detail = client.get_recording(&recording.id).await?;
-        if !detail.transcript.is_empty() {
+        if detail.transcript.is_empty() {
+            crate::login_log::debug(&format!(
+                "no Plaud transcript yet for \"{}\" (id {})",
+                recording.filename, recording.id
+            ));
+        } else {
             let transcript_path = final_path.with_extension("txt");
             let content = if settings.create_info_txt {
                 build_info_file(
@@ -175,18 +207,26 @@ async fn download_one(
             };
             fs::write(&transcript_path, content).map_err(|e| e.to_string())?;
         }
-    } else if settings.create_info_txt {
-        let info_path = final_path.with_extension("txt");
-        let content = build_info_file(
-            &recording.filename,
-            recording.start_time,
-            recording.duration,
-            "",
-        );
-        fs::write(&info_path, content).map_err(|e| e.to_string())?;
+    } else {
+        if settings.download_transcript {
+            crate::login_log::debug(&format!(
+                "skip transcript for \"{}\" (id {}): Plaud reports isTrans=false",
+                recording.filename, recording.id
+            ));
+        }
+        if settings.create_info_txt {
+            let info_path = final_path.with_extension("txt");
+            let content = build_info_file(
+                &recording.filename,
+                recording.start_time,
+                recording.duration,
+                "",
+            );
+            fs::write(&info_path, content).map_err(|e| e.to_string())?;
+        }
     }
 
-    Ok(())
+    Ok(final_path)
 }
 
 /// How often the auto-sync loop checks Plaud for new recordings. Plaud has no
@@ -198,11 +238,26 @@ pub const AUTO_SYNC_TICK_SECS: u64 = 60;
 /// every tick and download anything not already on disk, so recordings land
 /// within ~a minute of appearing. Re-reads settings every tick so toggling
 /// auto-sync takes effect without a restart.
+/// After a sync failure, wait longer before the next attempt: 1 min, 5 min,
+/// 15 min, then hourly. Without this a hard failure (e.g. an expired session
+/// that needs re-sign-in) retries every 60s forever, hammering the API and
+/// flooding the log. Any success resets the schedule.
+fn failure_backoff_secs(consecutive_failures: u32) -> u64 {
+    match consecutive_failures {
+        0 => AUTO_SYNC_TICK_SECS,
+        1 => 5 * 60,
+        2 => 15 * 60,
+        _ => 60 * 60,
+    }
+}
+
 pub async fn auto_sync_loop(app: AppHandle) {
     use std::sync::atomic::Ordering;
 
+    let mut consecutive_failures = 0u32;
     loop {
-        tokio::time::sleep(std::time::Duration::from_secs(AUTO_SYNC_TICK_SECS)).await;
+        let wait = failure_backoff_secs(consecutive_failures);
+        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
 
         let (storage, settings, logged_in) = {
             let state = app.state::<AppState>();
@@ -228,6 +283,10 @@ pub async fn auto_sync_loop(app: AppHandle) {
 
         match sync_recordings(&app, &storage, &settings).await {
             Ok(result) => {
+                if consecutive_failures > 0 {
+                    crate::login_log::info("auto-sync recovered after earlier failures");
+                }
+                consecutive_failures = 0;
                 app.state::<AppState>()
                     .last_sync_epoch
                     .store(crate::state::now_epoch(), Ordering::Relaxed);
@@ -246,9 +305,7 @@ pub async fn auto_sync_loop(app: AppHandle) {
                 // setting is on; downloads the models once if missing).
                 let transcribed = crate::commands::auto_transcribe_new(&app).await;
                 if transcribed > 0 {
-                    crate::login_log::info(&format!(
-                        "auto-transcribe: {transcribed} transcribed"
-                    ));
+                    crate::login_log::info(&format!("auto-transcribe: {transcribed} transcribed"));
                     changed = true;
                 }
                 if changed {
@@ -256,7 +313,17 @@ pub async fn auto_sync_loop(app: AppHandle) {
                 }
             }
             Err(e) => {
-                crate::login_log::error(&format!("auto-sync failed: {e}"));
+                consecutive_failures += 1;
+                let next_in = failure_backoff_secs(consecutive_failures);
+                if consecutive_failures == 1 {
+                    crate::login_log::error(&format!(
+                        "auto-sync failed: {e} (retrying in {next_in}s; if this persists, sign in again)"
+                    ));
+                } else {
+                    crate::login_log::warn(&format!(
+                        "auto-sync still failing ({consecutive_failures} in a row, next retry in {next_in}s): {e}"
+                    ));
+                }
                 let _ = app.emit("auto-sync-error", e);
             }
         }
@@ -446,6 +513,15 @@ mod tests {
             filename_style: style.into(),
             ..AppSettings::default()
         }
+    }
+
+    #[test]
+    fn failure_backoff_grows_and_caps() {
+        assert_eq!(failure_backoff_secs(0), AUTO_SYNC_TICK_SECS);
+        assert_eq!(failure_backoff_secs(1), 300);
+        assert_eq!(failure_backoff_secs(2), 900);
+        assert_eq!(failure_backoff_secs(3), 3600);
+        assert_eq!(failure_backoff_secs(50), 3600);
     }
 
     #[test]

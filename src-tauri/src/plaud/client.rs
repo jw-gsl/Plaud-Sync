@@ -86,6 +86,11 @@ impl PlaudClient {
                         &mut visited_bases,
                     ) {
                         Ok(Some(region)) => {
+                            crate::login_log::info(&format!(
+                                "region redirect: '{}' -> '{region}'",
+                                self.region
+                            ));
+                            self.auth.persist_region(&region);
                             self.region = region;
                             continue;
                         }

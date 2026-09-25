@@ -93,6 +93,7 @@ pub fn run() {
             commands::set_autostart,
             commands::get_autostart,
             commands::get_local_model_status,
+            commands::list_local_models,
             commands::get_local_pipeline_status,
             commands::download_local_model,
             commands::download_local_pipeline,

@@ -287,10 +287,8 @@ impl PlaudAuth {
         // No session cookie — inspect Plaud's in-body status. A region mismatch
         // tells us the correct API host; anything else is a surfaced error.
         {
-            if let Some(api) = json["data"]["domains"]["api"].as_str() {
-                if let Some(correct) = region_from_redirect(api) {
-                    return Ok(SsoOutcome::RegionRedirect(correct));
-                }
+            if let Some(correct) = region_redirect_from_body(&json) {
+                return Ok(SsoOutcome::RegionRedirect(correct));
             }
             // Recognised SSO identity but no linked Plaud account: the backend
             // echoes the SSO identity with a null account `email`. This means the
@@ -348,6 +346,12 @@ impl PlaudAuth {
 
     /// Exchange the stored `pld_urt` refresh token for a fresh `pld_ut` user
     /// token via `/auth/refresh-user-token`.
+    ///
+    /// Plaud answers `200 OK` with an in-body `{status:-302, data.domains.api}`
+    /// (and no session cookie) when the refresh token belongs to an account in
+    /// another region — e.g. a session adopted from web.plaud.ai while our
+    /// stored region still says `us`. We follow that redirect once, persist the
+    /// corrected region, and retry, instead of failing with "no new token".
     pub async fn refresh_with_user_token(&self) -> Result<PlaudTokenData, String> {
         let refresh_token = self
             .storage
@@ -356,34 +360,104 @@ impl PlaudAuth {
             .ok_or_else(|| "No refresh token stored.".to_string())?;
         let region = self.storage.get_region();
 
+        let outcome = match self.refresh_attempt(&refresh_token, &region).await? {
+            RefreshOutcome::RegionRedirect(correct) if correct != region => {
+                crate::login_log::info(&format!(
+                    "refresh region mismatch — retrying in region '{correct}' and persisting it"
+                ));
+                let _ = self.storage.save_region(&correct);
+                self.refresh_attempt(&refresh_token, &correct).await?
+            }
+            other => other,
+        };
+
+        match outcome {
+            RefreshOutcome::Session(token) => Ok(token),
+            RefreshOutcome::RegionRedirect(_) => {
+                Err("Could not resolve your account's region during refresh.".to_string())
+            }
+            RefreshOutcome::Error(msg) => Err(msg),
+        }
+    }
+
+    /// One POST to `/auth/refresh-user-token` for `region`, classifying the
+    /// response. Plaud can return HTTP 200 with an error in the body, so the
+    /// body status/msg are parsed and logged, not just the HTTP status.
+    async fn refresh_attempt(
+        &self,
+        refresh_token: &str,
+        region: &str,
+    ) -> Result<RefreshOutcome, String> {
         let client = reqwest::Client::new();
         let res =
-            browser_headers(client.post(format!("{}/auth/refresh-user-token", base_url(&region))))
+            browser_headers(client.post(format!("{}/auth/refresh-user-token", base_url(region))))
                 .header("app-platform", "web")
                 .header("Cookie", format!("pld_urt={refresh_token}"))
                 .send()
                 .await
                 .map_err(|e| format!("Network error: {e}"))?;
 
+        let status = res.status();
+        let headers = res.headers().clone();
+        let cookie_names: Vec<String> = headers
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .map(|s| s.split('=').next().unwrap_or("").trim().to_string())
+            .collect();
+        let body_text = res.text().await.unwrap_or_default();
+        let json: serde_json::Value =
+            serde_json::from_str(&body_text).unwrap_or(serde_json::Value::Null);
+        let app_status = json["status"].as_i64().unwrap_or(0);
+        let msg = json["msg"].as_str().unwrap_or("").to_string();
         crate::login_log::info(&format!(
-            "refresh-user-token (region={region}) -> {}",
-            res.status()
+            "refresh-user-token (region={region}) -> http={status} cookies=[{}] body.status={app_status} msg=\"{msg}\"",
+            cookie_names.join(",")
         ));
-        if !res.status().is_success() {
-            return Err(format!("Session refresh failed: {}", res.status()));
+
+        if let Some(user_token) = extract_set_cookie(&headers, "pld_ut") {
+            // The endpoint may rotate the refresh token too.
+            if let Some(new_refresh) = extract_set_cookie(&headers, "pld_urt") {
+                let _ = self.storage.save_refresh_token(&new_refresh);
+            }
+            let token = build_token_data(&user_token, Some("Bearer"))?;
+            self.storage.save_token(&token).map_err(|e| e.to_string())?;
+            return Ok(RefreshOutcome::Session(token));
         }
 
-        let user_token = extract_set_cookie(res.headers(), "pld_ut")
-            .ok_or_else(|| "Session refresh did not return a new token.".to_string())?;
-
-        // The endpoint may rotate the refresh token too.
-        if let Some(new_refresh) = extract_set_cookie(res.headers(), "pld_urt") {
-            let _ = self.storage.save_refresh_token(&new_refresh);
+        if !status.is_success() {
+            return Ok(RefreshOutcome::Error(format!(
+                "Session refresh failed: {status}{}",
+                if msg.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({msg})")
+                }
+            )));
         }
 
-        let token = build_token_data(&user_token, Some("Bearer"))?;
-        self.storage.save_token(&token).map_err(|e| e.to_string())?;
-        Ok(token)
+        // HTTP 200 without a session cookie — inspect the in-body status.
+        if let Some(correct) = region_redirect_from_body(&json) {
+            return Ok(RefreshOutcome::RegionRedirect(correct));
+        }
+
+        Ok(RefreshOutcome::Error(if msg.is_empty() {
+            "Session refresh did not return a new token — please sign in again.".to_string()
+        } else {
+            format!("Session refresh rejected by Plaud: {msg} (status {app_status}) — please sign in again.")
+        }))
+    }
+
+    /// Persist a region discovered at request time (e.g. an in-body -302
+    /// redirect) so later calls — including token refresh — use the right host
+    /// without re-discovering it every sync.
+    pub(crate) fn persist_region(&self, region: &str) {
+        match self.storage.save_region(region) {
+            Ok(()) => crate::login_log::info(&format!("persisted corrected region '{region}'")),
+            Err(e) => {
+                crate::login_log::warn(&format!("could not persist region '{region}': {e}"));
+            }
+        }
     }
 
     pub fn login_with_jwt(&self, jwt: &str, region: &str) -> Result<PlaudTokenData, String> {
@@ -422,6 +496,14 @@ fn extract_set_cookie(headers: &reqwest::header::HeaderMap, name: &str) -> Optio
     found
 }
 
+/// Extract the corrected region from an in-body Plaud region redirect
+/// (`{status:-302, data:{domains:{api:"https://api-euc1.plaud.ai"}}}`).
+fn region_redirect_from_body(json: &serde_json::Value) -> Option<String> {
+    json["data"]["domains"]["api"]
+        .as_str()
+        .and_then(region_from_redirect)
+}
+
 /// Outcome of `login_with_sso`: either a live Plaud session, or the SSO identity
 /// is recognised but not yet linked to a Plaud account (the user must finish
 /// sign-up in the webview).
@@ -438,6 +520,16 @@ enum PwOutcome {
     /// Signed in; token persisted.
     Session(PlaudTokenData),
     /// The account lives in another region; value is the region to retry in.
+    RegionRedirect(String),
+    /// A surfaced, user-facing failure.
+    Error(String),
+}
+
+/// Result of a single `/auth/refresh-user-token` attempt.
+enum RefreshOutcome {
+    /// A fresh `pld_ut` was received and persisted.
+    Session(PlaudTokenData),
+    /// The refresh token belongs to another region; value is the region to use.
     RegionRedirect(String),
     /// A surfaced, user-facing failure.
     Error(String),
@@ -507,6 +599,24 @@ mod tests {
             HeaderValue::from_static("pld_ut=\"\"; Max-Age=0"),
         );
         assert_eq!(extract_set_cookie(&headers, "pld_ut"), None);
+    }
+
+    #[test]
+    fn region_redirect_from_body_resolves_domains_api() {
+        // Plaud's 200-with-error shape: no cookie, -302 + redirect host in body.
+        let json: serde_json::Value = serde_json::json!({
+            "status": -302,
+            "msg": "user region mismatch",
+            "data": { "domains": { "api": "https://api-euc1.plaud.ai" } }
+        });
+        assert_eq!(region_redirect_from_body(&json), Some("eu".to_string()));
+    }
+
+    #[test]
+    fn region_redirect_from_body_ignores_other_bodies() {
+        let json: serde_json::Value =
+            serde_json::json!({ "status": 1, "msg": "refresh token invalid" });
+        assert_eq!(region_redirect_from_body(&json), None);
     }
 
     #[test]

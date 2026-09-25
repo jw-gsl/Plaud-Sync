@@ -9,16 +9,22 @@ use sherpa_onnx::{
     FastClusteringConfig, OfflineRecognizer, OfflineRecognizerConfig, OfflineSpeakerDiarization,
     OfflineSpeakerDiarizationConfig, OfflineSpeakerSegmentationModelConfig,
     OfflineSpeakerSegmentationPyannoteModelConfig, OfflineTransducerModelConfig,
-    SileroVadModelConfig, VadModelConfig, VoiceActivityDetector,
+    OfflineWhisperModelConfig, SileroVadModelConfig, VadModelConfig, VoiceActivityDetector,
 };
 
-pub use model_store::{LocalModelStatus, LocalPipelineStatus, MODEL_ID};
+pub use model_store::{
+    all_model_statuses, default_model_spec, find_model_spec, LocalModelStatus, LocalPipelineStatus,
+    ModelSpec,
+};
 
 const SAMPLE_RATE: i32 = 16_000;
 // Parakeet's exported encoder has a finite positional-attention window. Keep
 // a margin below its ~200-second limit so long recordings cannot trigger an
 // ONNX shape exception (which would otherwise abort across the C FFI boundary).
-const MAX_CHUNK_SAMPLES: usize = 180 * SAMPLE_RATE as usize;
+const TRANSDUCER_MAX_CHUNK_SAMPLES: usize = 180 * SAMPLE_RATE as usize;
+// Whisper's ONNX graph is fixed to its 30-second training window; feeding more
+// than 30 s per stream fails the input shape check.
+const WHISPER_MAX_CHUNK_SAMPLES: usize = 30 * SAMPLE_RATE as usize;
 /// Error message returned when a transcription is cancelled. The Tauri command
 /// and the UI both match on "cancel" to treat it as a no-op, not a failure.
 const CANCELLED: &str = "Local transcription cancelled";
@@ -87,21 +93,28 @@ struct SpeakerSegment {
     speaker: u32,
 }
 
-/// Run Parakeet on one local recording. This function is intentionally
-/// synchronous so callers can place it on Tokio's blocking pool and keep the
-/// Tauri command/event loop responsive.
+/// Run the selected local ASR model on one recording. This function is
+/// intentionally synchronous so callers can place it on Tokio's blocking pool
+/// and keep the Tauri command/event loop responsive.
 pub fn transcribe_file(
     audio_path: &Path,
     app_data_dir: &Path,
+    model_id: &str,
     recording_id: &str,
     cancelled: &AtomicBool,
     progress: &dyn Fn(u8, &str),
 ) -> Result<LocalTranscriptResult, String> {
-    let Some((encoder, decoder, joiner, tokens)) = model_store::model_paths(app_data_dir) else {
-        return Err(
-            "The Parakeet model is not fully installed. Download it from Settings first."
-                .to_string(),
-        );
+    let spec = find_model_spec(model_id)
+        .ok_or_else(|| format!("Unknown transcription model \"{model_id}\""))?;
+    let Some(paths) = model_store::model_paths(app_data_dir, spec) else {
+        return Err(format!(
+            "The {} model is not fully installed. Download it from Settings first.",
+            spec.name
+        ));
+    };
+    let (max_chunk_samples, vad_max_speech_duration) = match spec.engine {
+        model_store::EngineKind::Transducer => (TRANSDUCER_MAX_CHUNK_SAMPLES, 180.0),
+        model_store::EngineKind::Whisper => (WHISPER_MAX_CHUNK_SAMPLES, 29.0),
     };
 
     progress(4, "Decoding audio…");
@@ -112,28 +125,50 @@ pub fn transcribe_file(
     }
 
     let mut config = OfflineRecognizerConfig::default();
-    config.model_config.transducer = OfflineTransducerModelConfig {
-        encoder: Some(encoder.to_string_lossy().to_string()),
-        decoder: Some(decoder.to_string_lossy().to_string()),
-        joiner: Some(joiner.to_string_lossy().to_string()),
-    };
-    config.model_config.tokens = Some(tokens.to_string_lossy().to_string());
-    config.model_config.model_type = Some("nemo_transducer".to_string());
+    match spec.engine {
+        model_store::EngineKind::Transducer => {
+            config.model_config.transducer = OfflineTransducerModelConfig {
+                encoder: Some(paths.encoder.to_string_lossy().to_string()),
+                decoder: Some(paths.decoder.to_string_lossy().to_string()),
+                joiner: paths
+                    .joiner
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string()),
+            };
+            config.model_config.model_type = Some("nemo_transducer".to_string());
+        }
+        model_store::EngineKind::Whisper => {
+            // English-only transcription: the settings description promises
+            // English, and pinning the language avoids Whisper's occasional
+            // translation/Transcription task confusion on accented speech.
+            config.model_config.whisper = OfflineWhisperModelConfig {
+                encoder: Some(paths.encoder.to_string_lossy().to_string()),
+                decoder: Some(paths.decoder.to_string_lossy().to_string()),
+                language: Some("en".to_string()),
+                task: Some("transcribe".to_string()),
+                tail_paddings: -1,
+                enable_token_timestamps: true,
+                enable_segment_timestamps: false,
+            };
+            config.decoding_method = Some("greedy_search".to_string());
+        }
+    }
+    config.model_config.tokens = Some(paths.tokens.to_string_lossy().to_string());
     config.model_config.provider = Some("cpu".to_string());
     config.model_config.num_threads = recommended_threads();
 
     let recognizer = OfflineRecognizer::create(&config)
-        .ok_or_else(|| "Could not initialize the Parakeet recognizer".to_string())?;
+        .ok_or_else(|| format!("Could not initialize the {} recognizer", spec.name))?;
 
     progress(8, "Detecting speech…");
     let pipeline_paths = model_store::pipeline_model_paths(app_data_dir);
     let vad_segments = pipeline_paths
         .as_ref()
-        .and_then(|paths| detect_speech_segments(&samples, &paths.vad));
+        .and_then(|paths| detect_speech_segments(&samples, &paths.vad, vad_max_speech_duration));
     let asr_ranges = vad_segments
         .clone()
         .filter(|segments| !segments.is_empty())
-        .unwrap_or_else(|| fallback_ranges(samples.len()));
+        .unwrap_or_else(|| fallback_ranges(samples.len(), max_chunk_samples));
 
     let mut asr_segments = Vec::new();
     let mut timestamps = Vec::new();
@@ -149,11 +184,12 @@ pub fn transcribe_file(
         .sum::<usize>()
         .max(1);
     let mut asr_done: usize = 0;
-    progress(10, "Transcribing with Parakeet…");
+    let transcribing_stage = format!("Transcribing with {}…", spec.name);
+    progress(10, &transcribing_stage);
 
     for (range_start, range_end) in asr_ranges {
         let mut range_offset = range_start;
-        for chunk in samples[range_start..range_end].chunks(MAX_CHUNK_SAMPLES) {
+        for chunk in samples[range_start..range_end].chunks(max_chunk_samples) {
             if cancelled.load(Ordering::Acquire) {
                 return Err(CANCELLED.to_string());
             }
@@ -162,7 +198,7 @@ pub fn transcribe_file(
             recognizer.decode(&stream);
             let result = stream
                 .get_result()
-                .ok_or_else(|| "Parakeet returned no recognition result".to_string())?;
+                .ok_or_else(|| format!("{} returned no recognition result", spec.name))?;
             let chunk_text = result.text.trim();
             if !chunk_text.is_empty() {
                 let start_secs = range_offset as f32 / SAMPLE_RATE as f32;
@@ -185,7 +221,7 @@ pub fn transcribe_file(
             range_offset += chunk.len();
             asr_done += chunk.len();
             let pct = 10 + ((asr_done as f32 / asr_total as f32) * 65.0) as u8;
-            progress(pct.min(75), "Transcribing with Parakeet…");
+            progress(pct.min(75), &transcribing_stage);
         }
     }
 
@@ -221,7 +257,7 @@ pub fn transcribe_file(
         .collect::<Vec<_>>();
     let text = render_transcript(&speaker_segments, used_diarization);
     if text.is_empty() {
-        return Err("Parakeet returned an empty transcript".to_string());
+        return Err(format!("{} returned an empty transcript", spec.name));
     }
 
     progress(94, "Saving transcript…");
@@ -232,8 +268,8 @@ pub fn transcribe_file(
         schema_version: 2,
         source_recording_id: recording_id.to_string(),
         source_audio: audio_path.to_string_lossy().to_string(),
-        model: MODEL_ID.to_string(),
-        model_revision: model_store::MODEL_REVISION.to_string(),
+        model: spec.id.to_string(),
+        model_revision: spec.revision.to_string(),
         text: text.clone(),
         audio_duration_secs: duration,
         timestamps: has_timestamps.then_some(timestamps),
@@ -248,8 +284,8 @@ pub fn transcribe_file(
 
     Ok(LocalTranscriptResult {
         text,
-        model: MODEL_ID.to_string(),
-        model_revision: model_store::MODEL_REVISION.to_string(),
+        model: spec.id.to_string(),
+        model_revision: spec.revision.to_string(),
         transcript_path: transcript_path.to_string_lossy().to_string(),
         metadata_path: metadata_path.to_string_lossy().to_string(),
         audio_duration_secs: duration,
@@ -259,14 +295,18 @@ pub fn transcribe_file(
     })
 }
 
-fn fallback_ranges(sample_count: usize) -> Vec<(usize, usize)> {
+fn fallback_ranges(sample_count: usize, max_chunk_samples: usize) -> Vec<(usize, usize)> {
     (0..sample_count)
-        .step_by(MAX_CHUNK_SAMPLES)
-        .map(|start| (start, (start + MAX_CHUNK_SAMPLES).min(sample_count)))
+        .step_by(max_chunk_samples)
+        .map(|start| (start, (start + max_chunk_samples).min(sample_count)))
         .collect()
 }
 
-fn detect_speech_segments(samples: &[f32], model: &Path) -> Option<Vec<(usize, usize)>> {
+fn detect_speech_segments(
+    samples: &[f32],
+    model: &Path,
+    max_speech_duration: f32,
+) -> Option<Vec<(usize, usize)>> {
     let mut config = VadModelConfig::default();
     config.sample_rate = SAMPLE_RATE;
     config.num_threads = recommended_threads().min(4);
@@ -277,7 +317,7 @@ fn detect_speech_segments(samples: &[f32], model: &Path) -> Option<Vec<(usize, u
         min_silence_duration: 0.5,
         min_speech_duration: 0.25,
         window_size: 512,
-        max_speech_duration: 180.0,
+        max_speech_duration,
     };
     let vad = VoiceActivityDetector::create(&config, 30.0)?;
     let mut ranges = Vec::new();
