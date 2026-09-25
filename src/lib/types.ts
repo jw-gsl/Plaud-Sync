@@ -44,6 +44,7 @@ export interface LocalModelStatus {
   sizeMb: number;
   modelDir: string;
   isDefault: boolean;
+  available: boolean;
 }
 
 export interface LocalPipelineStatus {

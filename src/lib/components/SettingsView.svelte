@@ -47,8 +47,11 @@
   const downloading = $derived(!!downloadingModelId);
   const busy = $derived(!!busyModelId);
 
+  // Models this machine can actually run (the MLX helper hides itself
+  // everywhere except Apple Silicon).
+  const offeredModels = $derived(modelStatuses.filter((m) => m.available));
   const selectedModel = $derived(
-    modelStatuses.find((m) => m.id === settings.transcriptionModel) ?? null,
+    offeredModels.find((m) => m.id === settings.transcriptionModel) ?? null,
   );
   // Local transcription is one feature: the chosen ASR model plus the shared
   // speaker-label models. Both install together, so "installed" means both.
@@ -299,7 +302,7 @@
     {/if}
     {#if modelStatuses.length}
       <div class="model-picker">
-        {#each modelStatuses as model}
+        {#each offeredModels as model}
           <!-- Clicking the card selects the model; it is only usable once installed. -->
           <div
             class="model-card {settings.transcriptionModel === model.id ? "selected" : ""}"
