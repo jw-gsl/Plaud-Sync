@@ -29,6 +29,7 @@ export interface AppSettings {
   startMinimized: boolean;
   localTranscription: boolean;
   autoTranscribe: boolean;
+  transcriptionModel: string;
 }
 
 export interface LocalModelStatus {
@@ -42,6 +43,7 @@ export interface LocalModelStatus {
   totalBytes: number;
   sizeMb: number;
   modelDir: string;
+  isDefault: boolean;
 }
 
 export interface LocalPipelineStatus {

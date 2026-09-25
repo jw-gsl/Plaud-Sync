@@ -33,21 +33,34 @@
     startMinimized: false,
     localTranscription: true,
     autoTranscribe: true,
+    transcriptionModel: "parakeet-tdt-0.6b-v3-int8",
   });
   let autostart = $state(false);
-  let modelStatus = $state<LocalModelStatus | null>(null);
+  let modelStatuses = $state<LocalModelStatus[]>([]);
   let pipelineStatus = $state<LocalPipelineStatus | null>(null);
   let modelProgress = $state<LocalModelProgress | null>(null);
-  // True while the combined model download is running (drives the "Downloading"
-  // state). `busy` is any model operation (download or delete) — it disables the
-  // buttons.
-  let downloading = $state(false);
-  let busy = $state(false);
+  // The model whose combined download is running (drives the per-row
+  // "Downloading" state). `busyModelId` is any model operation (download or
+  // delete) — it disables the buttons.
+  let downloadingModelId = $state("");
+  let busyModelId = $state("");
+  const downloading = $derived(!!downloadingModelId);
+  const busy = $derived(!!busyModelId);
 
-  // Local transcription is a single feature: Parakeet transcription plus speaker
-  // labels. Both model sets install together, so the UI treats them as one.
-  const modelsInstalled = $derived(!!modelStatus?.installed && !!pipelineStatus?.installed);
-  const combinedSizeMb = $derived((modelStatus?.sizeMb ?? 670) + (pipelineStatus?.sizeMb ?? 104));
+  const selectedModel = $derived(
+    modelStatuses.find((m) => m.id === settings.transcriptionModel) ?? null,
+  );
+  // Local transcription is one feature: the chosen ASR model plus the shared
+  // speaker-label models. Both install together, so "installed" means both.
+  function modelInstalled(model: LocalModelStatus): boolean {
+    return model.installed && !!pipelineStatus?.installed;
+  }
+  const modelsInstalled = $derived(
+    !!selectedModel && modelInstalled(selectedModel),
+  );
+  const combinedSizeMb = $derived(
+    (selectedModel?.sizeMb ?? modelStatuses[0]?.sizeMb ?? 670) + (pipelineStatus?.sizeMb ?? 104),
+  );
 
   function setTheme(theme: Theme) {
     settings.theme = theme;
@@ -99,7 +112,7 @@
     settings = await api.getSettings();
     await refreshExample(settings);
     try {
-      modelStatus = await api.getLocalModelStatus();
+      modelStatuses = await api.listLocalModels();
     } catch {
       // The model status is non-critical to the rest of Settings.
     }
@@ -138,17 +151,19 @@
     }
   }
 
-  // Download the Parakeet transcription model and the speaker-diarization models
-  // together — local transcription is one feature, not two optional pieces. Only
-  // the pieces that aren't already installed are fetched.
-  async function downloadModels() {
-    busy = true;
-    downloading = true;
+  // Download one transcription model and the shared speaker-diarization models
+  // together — local transcription is one feature, not two optional pieces.
+  // Only the pieces that aren't already installed are fetched.
+  async function downloadModels(modelId: string) {
+    busyModelId = modelId;
+    downloadingModelId = modelId;
     modelProgress = null;
     error = "";
     try {
-      if (!modelStatus?.installed) {
-        modelStatus = await api.downloadLocalModel();
+      const model = modelStatuses.find((m) => m.id === modelId);
+      if (model && !model.installed) {
+        const updated = await api.downloadLocalModel(modelId);
+        modelStatuses = modelStatuses.map((m) => (m.id === modelId ? updated : m));
         modelProgress = null;
       }
       if (!pipelineStatus?.installed) {
@@ -158,24 +173,24 @@
       const message = String(e);
       if (!message.toLowerCase().includes("cancel")) error = message;
     } finally {
-      downloading = false;
+      downloadingModelId = "";
       modelProgress = null;
-      busy = false;
+      busyModelId = "";
     }
   }
 
-  async function deleteModels() {
-    busy = true;
+  async function deleteModels(modelId: string) {
+    busyModelId = modelId;
     error = "";
     try {
       await api.deleteLocalPipeline();
-      await api.deleteLocalModel();
+      await api.deleteLocalModel(modelId);
       pipelineStatus = await api.getLocalPipelineStatus();
-      modelStatus = await api.getLocalModelStatus();
+      modelStatuses = await api.listLocalModels();
     } catch (e) {
       error = String(e);
     } finally {
-      busy = false;
+      busyModelId = "";
     }
   }
 
@@ -260,11 +275,11 @@
       <div>
         <strong>Enable local transcription</strong>
         <div class="meta">
-          Transcribe downloaded recordings on this computer with Parakeet v3 and label who is
-          speaking (Speaker 1, Speaker 2) using on-device voice-activity detection and speaker
-          diarization. Audio stays local and it works on macOS and Windows. The models total about
-          {combinedSizeMb} MB; their revisions are pinned and change only through a Plaud Sync
-          update.
+          Transcribe downloaded recordings on this computer and label who is speaking
+          (Speaker 1, Speaker 2) using on-device voice-activity detection and speaker
+          diarization. Audio stays local and it works on macOS and Windows. Choose a
+          transcription model below (about {combinedSizeMb} MB for the selected model);
+          model revisions are pinned and change only through a Plaud Sync update.
         </div>
       </div>
       <input type="checkbox" bind:checked={settings.localTranscription} />
@@ -282,37 +297,75 @@
         <input type="checkbox" bind:checked={settings.autoTranscribe} />
       </div>
     {/if}
-    <div class="model-row">
-      <div class="model-state">
-        {#if downloading}
-          <span class="status-pill downloading">Downloading</span>
-          <span class="meta">{#if modelProgress}{modelProgress.file} · {formatBytes(modelProgress.downloadedTotal)} / {formatBytes(modelProgress.total)}{:else}Preparing download…{/if}</span>
-        {:else if modelsInstalled}
-          <span class="status-pill installed">Installed</span>
-          <span class="meta">
-            Ready for local transcription with speaker labels · revision {modelStatus?.revision.slice(0, 8)}
-          </span>
-        {:else}
-          <span class="status-pill">Not installed</span>
-          <span class="meta">Download the models once to enable local transcription.</span>
-        {/if}
+    {#if modelStatuses.length}
+      <div class="model-picker">
+        {#each modelStatuses as model}
+          <!-- Clicking the card selects the model; it is only usable once installed. -->
+          <div
+            class="model-card {settings.transcriptionModel === model.id ? "selected" : ""}"
+            role="button"
+            tabindex="0"
+            onclick={() => (settings.transcriptionModel = model.id)}
+            onkeydown={(e) => {
+              if (e.key === "Enter" || e.key === " ") settings.transcriptionModel = model.id;
+            }}
+          >
+            <input
+              type="radio"
+              name="transcription-model"
+              checked={settings.transcriptionModel === model.id}
+              aria-label={`Use {model.name}`}
+            />
+            <div class="model-info">
+              <strong>{model.name}{#if model.isDefault} · default{/if}</strong>
+              <div class="meta">{model.description}</div>
+              <div class="meta">
+                About {model.sizeMb} MB
+                {#if !modelInstalled(model)}+ {pipelineStatus?.sizeMb ?? 104} MB speaker labels{/if}
+              </div>
+            </div>
+            <div class="model-state">
+              {#if downloadingModelId === model.id}
+                <span class="status-pill downloading">Downloading</span>
+              {:else if modelInstalled(model)}
+                <span class="status-pill installed">Installed</span>
+              {:else if model.installed}
+                <span class="status-pill">Speech model only</span>
+              {:else}
+                <span class="status-pill">Not installed</span>
+              {/if}
+            </div>
+            <div class="model-actions">
+              {#if downloadingModelId === model.id}
+                <button class="btn btn-ghost btn-sm" onclick={() => cancelModelDownload()}>Cancel</button>
+              {:else if modelInstalled(model)}
+                <button class="btn btn-ghost btn-sm" onclick={() => deleteModels(model.id)} disabled={busy}>
+                  Remove models
+                </button>
+              {:else}
+                <button class="btn btn-primary btn-sm" onclick={() => downloadModels(model.id)} disabled={busy}>
+                  {model.installed ? "Download speech models" : "Download models"}
+                </button>
+              {/if}
+            </div>
+          </div>
+          {#if downloadingModelId === model.id}
+            <div class="progress-wrap">
+              <div class="progress-bar"><div style={`width: ${modelProgress ? (modelProgress.downloadedTotal / Math.max(modelProgress.total, 1)) * 100 : 0}%`}></div></div>
+              <span class="meta">{#if modelProgress}{modelProgress.file} · {formatBytes(modelProgress.downloadedTotal)} / {formatBytes(modelProgress.total)}{:else}Preparing download…{/if}</span>
+            </div>
+          {/if}
+        {/each}
       </div>
-      <div class="model-actions">
-        {#if downloading}
-          <button class="btn btn-ghost btn-sm" onclick={cancelModelDownload}>Cancel</button>
-        {:else if modelsInstalled}
-          <button class="btn btn-ghost btn-sm" onclick={deleteModels} disabled={busy}>Remove models</button>
-        {:else}
-          <button class="btn btn-primary btn-sm" onclick={downloadModels} disabled={busy}>
-            Download models
-          </button>
-        {/if}
-      </div>
-    </div>
-    {#if downloading && modelProgress}
-      <div class="progress-wrap">
-        <div class="progress-bar"><div style={`width: ${(modelProgress.downloadedTotal / Math.max(modelProgress.total, 1)) * 100}%`}></div></div>
-      </div>
+      {#if modelsInstalled}
+        <p class="meta auto-note">
+          Ready for local transcription with speaker labels · revision {selectedModel?.revision.slice(0, 8)}
+        </p>
+      {:else}
+        <p class="meta auto-note">
+          Download the models for the transcription model you want to use; they are fetched once.
+        </p>
+      {/if}
     {/if}
   </fieldset>
 
@@ -515,15 +568,38 @@
     margin-top: 4px;
   }
 
-  .model-row {
+  .model-picker {
     display: flex;
-    justify-content: space-between;
+    flex-direction: column;
+    gap: 10px;
+    margin-top: 10px;
+  }
+
+  .model-card {
+    display: flex;
     align-items: center;
     gap: 12px;
-    margin-top: 10px;
     padding: 10px 12px;
     border-radius: 8px;
     background: var(--surface-muted);
+    border: 1px solid transparent;
+    cursor: pointer;
+    text-align: left;
+  }
+
+  .model-card.selected {
+    border-color: var(--primary);
+  }
+
+  .model-card input[type="radio"] {
+    flex: none;
+    pointer-events: none;
+    margin: 0;
+  }
+
+  .model-info {
+    flex: 1;
+    min-width: 0;
   }
 
   .model-state {

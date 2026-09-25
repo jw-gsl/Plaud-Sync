@@ -167,13 +167,37 @@ pub fn get_cached_recordings(state: State<'_, AppState>) -> Result<Vec<PlaudReco
 pub fn get_local_model_status(
     app: AppHandle,
     state: State<'_, AppState>,
+    model_id: Option<String>,
 ) -> Result<crate::transcription::LocalModelStatus, String> {
+    let spec = crate::transcription::find_model_spec(
+        model_id
+            .as_deref()
+            .unwrap_or(crate::transcription::model_store::DEFAULT_MODEL_ID),
+    )
+    .ok_or_else(|| "Unknown transcription model.".to_string())?;
     let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let mut status = crate::transcription::model_store::model_status(&app_data);
+    let mut status = crate::transcription::model_store::model_status(&app_data, spec);
     status.downloading = state
         .local_model_download_running
         .load(std::sync::atomic::Ordering::Acquire);
     Ok(status)
+}
+
+/// Status for every transcription model offered in Settings.
+#[tauri::command]
+pub fn list_local_models(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::transcription::LocalModelStatus>, String> {
+    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let downloading = state
+        .local_model_download_running
+        .load(std::sync::atomic::Ordering::Acquire);
+    let mut statuses = crate::transcription::all_model_statuses(&app_data);
+    for status in &mut statuses {
+        status.downloading = downloading;
+    }
+    Ok(statuses)
 }
 
 #[tauri::command]
@@ -250,7 +274,10 @@ pub async fn delete_local_pipeline(
 pub async fn download_local_model(
     app: AppHandle,
     state: State<'_, AppState>,
+    model_id: String,
 ) -> Result<crate::transcription::LocalModelStatus, String> {
+    let spec = crate::transcription::find_model_spec(&model_id)
+        .ok_or_else(|| "Unknown transcription model.".to_string())?;
     if state
         .local_model_download_running
         .swap(true, std::sync::atomic::Ordering::AcqRel)
@@ -273,8 +300,12 @@ pub async fn download_local_model(
         .local_model_download_cancelled
         .store(false, std::sync::atomic::Ordering::Release);
     let _permit = ModelDownloadPermit(&state.local_model_download_running);
-    crate::transcription::model_store::download_model(&app, &state.local_model_download_cancelled)
-        .await
+    crate::transcription::model_store::download_model(
+        &app,
+        spec,
+        &state.local_model_download_cancelled,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -292,7 +323,13 @@ pub fn cancel_local_model_download(state: State<'_, AppState>) -> Result<(), Str
 }
 
 #[tauri::command]
-pub async fn delete_local_model(app: AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn delete_local_model(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    model_id: String,
+) -> Result<(), String> {
+    let spec = crate::transcription::find_model_spec(&model_id)
+        .ok_or_else(|| "Unknown transcription model.".to_string())?;
     if state
         .local_model_download_running
         .load(std::sync::atomic::Ordering::Acquire)
@@ -307,7 +344,7 @@ pub async fn delete_local_model(app: AppHandle, state: State<'_, AppState>) -> R
             "Wait for the active transcription to finish before removing the model.".to_string(),
         );
     }
-    crate::transcription::model_store::delete_model(&app).await
+    crate::transcription::model_store::delete_model(&app, spec).await
 }
 
 #[tauri::command]
@@ -347,12 +384,19 @@ pub(crate) async fn transcribe_recording_inner(
     if !settings.local_transcription {
         return Err("Enable local transcription in Settings first.".to_string());
     }
+    let spec =
+        crate::transcription::find_model_spec(&settings.transcription_model).ok_or_else(|| {
+            format!(
+                "Unknown transcription model \"{}\". Choose one in Settings.",
+                settings.transcription_model
+            )
+        })?;
     let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    if !crate::transcription::model_store::is_model_ready(&app_data) {
-        return Err(
-            "The Parakeet model is not fully installed. Download it from Settings first."
-                .to_string(),
-        );
+    if !crate::transcription::model_store::is_model_ready(&app_data, spec) {
+        return Err(format!(
+            "The {} model is not fully installed. Download it from Settings first.",
+            spec.name
+        ));
     }
 
     let root = std::path::PathBuf::from(&settings.download_dir);
@@ -377,6 +421,7 @@ pub(crate) async fn transcribe_recording_inner(
     let app_data_for_worker = app_data.clone();
     let audio_for_worker = audio_path.clone();
     let recording_id_for_worker = recording.id.clone();
+    let model_id_for_worker = settings.transcription_model.clone();
     // The blocking worker reports fine-grained progress through this callback.
     // AppHandle is Send + Sync, so it can emit events from the worker thread.
     let app_for_worker = app.clone();
@@ -397,6 +442,7 @@ pub(crate) async fn transcribe_recording_inner(
         crate::transcription::transcribe_file(
             &audio_for_worker,
             &app_data_for_worker,
+            &model_id_for_worker,
             &recording_id_for_worker,
             &cancelled,
             &progress,
@@ -470,8 +516,12 @@ pub(crate) async fn auto_transcribe_new(app: &AppHandle) -> usize {
     let Ok(app_data) = app.path().app_data_dir() else {
         return 0;
     };
-    let need_model = !crate::transcription::model_store::is_model_ready(&app_data);
-    let need_pipeline = crate::transcription::model_store::pipeline_model_paths(&app_data).is_none();
+    let Some(spec) = crate::transcription::find_model_spec(&settings.transcription_model) else {
+        return 0;
+    };
+    let need_model = !crate::transcription::model_store::is_model_ready(&app_data, spec);
+    let need_pipeline =
+        crate::transcription::model_store::pipeline_model_paths(&app_data).is_none();
     if need_model || need_pipeline {
         if state
             .local_model_download_running
@@ -486,6 +536,7 @@ pub(crate) async fn auto_transcribe_new(app: &AppHandle) -> usize {
         if need_model
             && crate::transcription::model_store::download_model(
                 app,
+                spec,
                 &state.local_model_download_cancelled,
             )
             .await

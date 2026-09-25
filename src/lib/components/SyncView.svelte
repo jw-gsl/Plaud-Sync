@@ -51,6 +51,9 @@
   // Local-model install state, so the row can offer to download the models when
   // they are missing instead of failing a transcription.
   let modelStatus = $state<LocalModelStatus | null>(null);
+  // The transcription model chosen in Settings; drives which model is shown
+  // as installed and downloaded on demand here.
+  let selectedModelId = $state("parakeet-tdt-0.6b-v3-int8");
   let pipelineStatus = $state<LocalPipelineStatus | null>(null);
   let downloadingModels = $state(false);
   let modelDownloadProgress = $state<LocalModelProgress | null>(null);
@@ -192,7 +195,9 @@
 
   async function refreshModelStatus() {
     try {
-      modelStatus = await api.getLocalModelStatus();
+      const settings = await api.getSettings();
+      selectedModelId = settings.transcriptionModel;
+      modelStatus = await api.getLocalModelStatus(selectedModelId);
     } catch {
       // Non-critical — the row just falls back to offering the download.
     }
@@ -349,7 +354,7 @@
     modelDownloadProgress = null;
     try {
       if (!modelStatus?.installed) {
-        modelStatus = await api.downloadLocalModel();
+        modelStatus = await api.downloadLocalModel(selectedModelId);
         modelDownloadProgress = null;
       }
       if (!pipelineStatus?.installed) {

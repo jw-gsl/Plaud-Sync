@@ -7,48 +7,138 @@ use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::AsyncWriteExt;
 
-/// Parakeet TDT 0.6B v3 converted to INT8 ONNX by the sherpa-onnx project.
-/// The three ONNX files are large; tokens.txt is intentionally kept as a
-/// separate file so a future model revision can be validated independently.
-pub const MODEL_ID: &str = "parakeet-tdt-0.6b-v3-int8";
-/// Hugging Face commit containing the exact artifacts described by MODEL_FILES.
-///
-/// Do not use `main` here. A model repository can be updated in place, which
-/// would otherwise make a released app download different bytes over time.
-pub const MODEL_REVISION: &str = "2bda32ec70b097a55adaa07d9a7173915b43cc78";
-const MODEL_REPO: &str =
-    "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8";
+/// Which sherpa-onnx decoder family an ASR model uses. The transcription
+/// pipeline builds a different `OfflineRecognizerConfig` (and uses a
+/// different audio chunk size) depending on this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EngineKind {
+    /// NeMo transducer (Parakeet): fast on CPU, long chunks supported.
+    Transducer,
+    /// OpenAI Whisper ONNX: stronger on accented/non-native English, but
+    /// the ONNX graph only accepts 30-second windows and it is slower.
+    Whisper,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileRole {
+    Encoder,
+    Decoder,
+    Joiner,
+    Tokens,
+}
 
 #[derive(Clone, Copy)]
 struct ModelFile {
     name: &'static str,
     size: u64,
     sha256: Option<&'static str>,
+    role: FileRole,
 }
 
-const MODEL_FILES: &[ModelFile] = &[
+/// Everything needed to download, validate, and load one transcription model.
+pub struct ModelSpec {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub description: &'static str,
+    pub engine: EngineKind,
+    pub repo: &'static str,
+    /// Pinned Hugging Face commit. Never use `main` here: a model repository
+    /// can be updated in place, which would otherwise make a released app
+    /// download different bytes over time.
+    pub revision: &'static str,
+    files: &'static [ModelFile],
+}
+
+pub const DEFAULT_MODEL_ID: &str = "parakeet-tdt-0.6b-v3-int8";
+
+const PARAKEET_FILES: &[ModelFile] = &[
     ModelFile {
         name: "encoder.int8.onnx",
         size: 652_184_281,
         // This is the file SHA-256 (x-linked-etag), not the Xet CAS hash.
         sha256: Some("acfc2b4456377e15d04f0243af540b7fe7c992f8d898d751cf134c3a55fd2247"),
+        role: FileRole::Encoder,
     },
     ModelFile {
         name: "decoder.int8.onnx",
         size: 11_845_275,
         sha256: Some("179e50c43d1a9de79c8a24149a2f9bac6eb5981823f2a2ed88d655b24248db4e"),
+        role: FileRole::Decoder,
     },
     ModelFile {
         name: "joiner.int8.onnx",
         size: 6_355_277,
         sha256: Some("3164c13fc2821009440d20fcb5fdc78bff28b4db2f8d0f0b329101719c0948b3"),
+        role: FileRole::Joiner,
     },
     ModelFile {
         name: "tokens.txt",
         size: 93_939,
         sha256: Some("d58544679ea4bc6ac563d1f545eb7d474bd6cfa467f0a6e2c1dc1c7d37e3c35d"),
+        role: FileRole::Tokens,
     },
 ];
+
+// Checksums verified against the full files downloaded from the pinned
+// commit on 2026-09-25.
+const WHISPER_FILES: &[ModelFile] = &[
+    ModelFile {
+        name: "large-v3-encoder.int8.onnx",
+        size: 766_671_985,
+        sha256: Some("d531cf17248acc43e8c09b472a0877055e770877857a5332fc1304b36534ec85"),
+        role: FileRole::Encoder,
+    },
+    ModelFile {
+        name: "large-v3-decoder.int8.onnx",
+        size: 1_008_265_203,
+        sha256: Some("ebc6bfd88e162a46cb3edee8a7e727e1dcbc65cabecb19e2573695e4d495e1af"),
+        role: FileRole::Decoder,
+    },
+    ModelFile {
+        name: "large-v3-tokens.txt",
+        size: 816_730,
+        sha256: Some("b34b360dbb493e781e479794586d661700670d65564001f23024971d1f2fa126"),
+        role: FileRole::Tokens,
+    },
+];
+
+/// Transcription models offered in Settings. The first entry is the default.
+pub const MODEL_SPECS: &[ModelSpec] = &[
+    ModelSpec {
+        id: "parakeet-tdt-0.6b-v3-int8",
+        name: "Parakeet TDT 0.6B v3 (INT8)",
+        description: "Fast on CPU. Good accuracy for clear speech; transcribes 25 European languages with punctuation and timestamps.",
+        engine: EngineKind::Transducer,
+        repo: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
+        revision: "2bda32ec70b097a55adaa07d9a7173915b43cc78",
+        files: PARAKEET_FILES,
+    },
+    ModelSpec {
+        id: "whisper-large-v3-int8",
+        name: "Whisper Large v3 (INT8)",
+        description: "Best accuracy for accented and non-native English. Slower on CPU and a ~1.8 GB download. English transcription.",
+        engine: EngineKind::Whisper,
+        repo: "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-large-v3",
+        revision: "2a6507094dd6020d939d78e3f1834a1d06267fca",
+        files: WHISPER_FILES,
+    },
+];
+
+pub fn find_model_spec(model_id: &str) -> Option<&'static ModelSpec> {
+    MODEL_SPECS.iter().find(|spec| spec.id == model_id)
+}
+
+/// Spec for the shipped default model.
+pub fn default_model_spec() -> &'static ModelSpec {
+    find_model_spec(DEFAULT_MODEL_ID).expect("default model must be registered")
+}
+
+fn model_file(spec: &'static ModelSpec, role: FileRole) -> &'static ModelFile {
+    spec.files
+        .iter()
+        .find(|file| file.role == role)
+        .unwrap_or_else(|| panic!("model {} has no {role:?} file", spec.id))
+}
 
 /// Optional speech-processing models. These are downloaded separately from
 /// Parakeet because they are only needed when speaker labels are requested.
@@ -112,6 +202,7 @@ pub struct LocalModelStatus {
     pub total_bytes: u64,
     pub size_mb: u64,
     pub model_dir: String,
+    pub is_default: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -124,10 +215,11 @@ pub struct ModelDownloadProgress {
     pub total: u64,
 }
 
-pub fn model_status(app_data_dir: &Path) -> LocalModelStatus {
-    let dir = model_dir(app_data_dir);
-    let total = MODEL_FILES.iter().map(|f| f.size).sum();
-    let downloaded = MODEL_FILES
+pub fn model_status(app_data_dir: &Path, spec: &'static ModelSpec) -> LocalModelStatus {
+    let dir = model_dir(app_data_dir, spec);
+    let total = spec.files.iter().map(|f| f.size).sum();
+    let downloaded = spec
+        .files
         .iter()
         .map(|f| {
             let path = dir.join(f.name);
@@ -135,21 +227,30 @@ pub fn model_status(app_data_dir: &Path) -> LocalModelStatus {
         })
         .sum();
     LocalModelStatus {
-        id: MODEL_ID.to_string(),
-        revision: MODEL_REVISION.to_string(),
-        name: "Parakeet TDT 0.6B v3 (INT8)".to_string(),
-        description: "Local multilingual transcription for 25 European languages, with punctuation and timestamps.".to_string(),
-        installed: is_model_ready(app_data_dir),
+        id: spec.id.to_string(),
+        revision: spec.revision.to_string(),
+        name: spec.name.to_string(),
+        description: spec.description.to_string(),
+        installed: is_model_ready(app_data_dir, spec),
         downloading: false,
         downloaded_bytes: downloaded,
         total_bytes: total,
         size_mb: (total / 1_000_000) + 1,
         model_dir: dir.to_string_lossy().to_string(),
+        is_default: spec.id == DEFAULT_MODEL_ID,
     }
 }
 
-pub fn model_dir(app_data_dir: &Path) -> PathBuf {
-    app_data_dir.join("models").join(MODEL_ID)
+/// Status for every registered model, in registration order.
+pub fn all_model_statuses(app_data_dir: &Path) -> Vec<LocalModelStatus> {
+    MODEL_SPECS
+        .iter()
+        .map(|spec| model_status(app_data_dir, spec))
+        .collect()
+}
+
+pub fn model_dir(app_data_dir: &Path, spec: &ModelSpec) -> PathBuf {
+    app_data_dir.join("models").join(spec.id)
 }
 
 pub fn pipeline_model_dir(app_data_dir: &Path) -> PathBuf {
@@ -196,8 +297,7 @@ pub fn pipeline_model_paths(app_data_dir: &Path) -> Option<PipelineModelPaths> {
         (&paths.embedding, EMBEDDING_SIZE, EMBEDDING_SHA256),
     ];
     if files.iter().all(|(path, size, hash)| {
-        path.metadata().map(|m| m.len() == *size).unwrap_or(false)
-            && verify_sha256(path, hash)
+        path.metadata().map(|m| m.len() == *size).unwrap_or(false) && verify_sha256(path, hash)
     }) {
         Some(paths)
     } else {
@@ -205,9 +305,9 @@ pub fn pipeline_model_paths(app_data_dir: &Path) -> Option<PipelineModelPaths> {
     }
 }
 
-pub fn is_model_ready(app_data_dir: &Path) -> bool {
-    let dir = model_dir(app_data_dir);
-    MODEL_FILES.iter().all(|file| {
+pub fn is_model_ready(app_data_dir: &Path, spec: &ModelSpec) -> bool {
+    let dir = model_dir(app_data_dir, spec);
+    spec.files.iter().all(|file| {
         let path = dir.join(file.name);
         path.metadata()
             .map(|meta| meta.len() == file.size)
@@ -219,37 +319,52 @@ pub fn is_model_ready(app_data_dir: &Path) -> bool {
     })
 }
 
-pub fn model_paths(app_data_dir: &Path) -> Option<(PathBuf, PathBuf, PathBuf, PathBuf)> {
-    if !is_model_ready(app_data_dir) {
+/// Installed file locations for one model, keyed by role.
+pub struct ModelPaths {
+    pub encoder: PathBuf,
+    pub decoder: PathBuf,
+    /// Only transducer models have a joiner.
+    pub joiner: Option<PathBuf>,
+    pub tokens: PathBuf,
+}
+
+pub fn model_paths(app_data_dir: &Path, spec: &'static ModelSpec) -> Option<ModelPaths> {
+    if !is_model_ready(app_data_dir, spec) {
         return None;
     }
-    let dir = model_dir(app_data_dir);
-    Some((
-        dir.join("encoder.int8.onnx"),
-        dir.join("decoder.int8.onnx"),
-        dir.join("joiner.int8.onnx"),
-        dir.join("tokens.txt"),
-    ))
+    let dir = model_dir(app_data_dir, spec);
+    let path_for = |role| dir.join(model_file(spec, role).name);
+    Some(ModelPaths {
+        encoder: path_for(FileRole::Encoder),
+        decoder: path_for(FileRole::Decoder),
+        joiner: spec
+            .files
+            .iter()
+            .any(|f| f.role == FileRole::Joiner)
+            .then(|| path_for(FileRole::Joiner)),
+        tokens: path_for(FileRole::Tokens),
+    })
 }
 
 pub async fn download_model(
     app: &AppHandle,
+    spec: &'static ModelSpec,
     cancelled: &AtomicBool,
 ) -> Result<LocalModelStatus, String> {
     let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let dir = model_dir(&app_data);
+    let dir = model_dir(&app_data, spec);
     tokio::fs::create_dir_all(&dir)
         .await
         .map_err(|e| format!("Could not create model directory: {e}"))?;
 
-    let total: u64 = MODEL_FILES.iter().map(|f| f.size).sum();
+    let total: u64 = spec.files.iter().map(|f| f.size).sum();
     let mut completed_total = 0u64;
     let client = reqwest::Client::builder()
         .user_agent("PlaudSync/0.4 local-model")
         .build()
         .map_err(|e| e.to_string())?;
 
-    for file in MODEL_FILES {
+    for file in spec.files {
         if cancelled.load(Ordering::Acquire) {
             return Err("Model download cancelled".to_string());
         }
@@ -269,7 +384,7 @@ pub async fn download_model(
         }
 
         let partial = destination.with_extension("partial");
-        let url = format!("{MODEL_REPO}/resolve/{MODEL_REVISION}/{}", file.name);
+        let url = format!("{}/resolve/{}/{}", spec.repo, spec.revision, file.name);
         let response = client
             .get(url)
             .send()
@@ -336,15 +451,15 @@ pub async fn download_model(
         completed_total += file.size;
     }
 
-    if !is_model_ready(&app_data) {
+    if !is_model_ready(&app_data, spec) {
         return Err("Model files downloaded but validation did not pass".to_string());
     }
-    Ok(model_status(&app_data))
+    Ok(model_status(&app_data, spec))
 }
 
-pub async fn delete_model(app: &AppHandle) -> Result<(), String> {
+pub async fn delete_model(app: &AppHandle, spec: &ModelSpec) -> Result<(), String> {
     let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
-    let dir = model_dir(&app_data);
+    let dir = model_dir(&app_data, spec);
     if dir.exists() {
         tokio::fs::remove_dir_all(&dir)
             .await
@@ -546,7 +661,15 @@ mod tests {
 
     #[test]
     fn model_path_is_under_app_data() {
-        assert!(model_dir(Path::new("/tmp/app-data")).ends_with("models/parakeet-tdt-0.6b-v3-int8"));
+        let specs = all_model_statuses(Path::new("/nonexistent-app-data"));
+        assert_eq!(specs.len(), MODEL_SPECS.len());
+        assert!(model_dir(Path::new("/tmp/app-data"), default_model_spec())
+            .ends_with("models/parakeet-tdt-0.6b-v3-int8"));
+        assert!(model_dir(
+            Path::new("/tmp/app-data"),
+            find_model_spec("whisper-large-v3-int8").unwrap()
+        )
+        .ends_with("models/whisper-large-v3-int8"));
     }
 
     #[test]

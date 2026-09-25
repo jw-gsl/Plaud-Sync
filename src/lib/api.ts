@@ -37,12 +37,16 @@ export const api = {
   revealRecording: (recording: Recording) =>
     invoke<void>("reveal_recording", { recording }),
   getSyncInfo: () => invoke<SyncInfo>("get_sync_info"),
-  getLocalModelStatus: () => invoke<LocalModelStatus>("get_local_model_status"),
+  getLocalModelStatus: (modelId?: string) =>
+    invoke<LocalModelStatus>("get_local_model_status", { modelId }),
+  listLocalModels: () => invoke<LocalModelStatus[]>("list_local_models"),
   getLocalPipelineStatus: () => invoke<LocalPipelineStatus>("get_local_pipeline_status"),
-  downloadLocalModel: () => invoke<LocalModelStatus>("download_local_model"),
+  downloadLocalModel: (modelId: string) =>
+    invoke<LocalModelStatus>("download_local_model", { modelId }),
   downloadLocalPipeline: () => invoke<LocalPipelineStatus>("download_local_pipeline"),
   cancelLocalModelDownload: () => invoke<void>("cancel_local_model_download"),
-  deleteLocalModel: () => invoke<void>("delete_local_model"),
+  deleteLocalModel: (modelId: string) =>
+    invoke<void>("delete_local_model", { modelId }),
   deleteLocalPipeline: () => invoke<void>("delete_local_pipeline"),
   transcribeRecording: (recording: Recording) =>
     invoke<LocalTranscriptResult>("transcribe_recording", { recording }),
