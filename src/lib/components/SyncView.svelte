@@ -46,6 +46,12 @@
   let search = $state("");
   let filter = $state<Filter>("all");
   let selected = $state<string[]>([]);
+  // Multi-select feeding the transcription queue; deliberately separate from
+  // `selected` (which drives download) so one action never sees the other's ids.
+  let transcribeSelected = $state<string[]>([]);
+  let queue = $state<Recording[]>([]);
+  let queueIndex = $state(0);
+  let queueCancel = false;
   let localTranscribing = $state<string | null>(null);
   let localProgress = $state<LocalTranscriptionProgress | null>(null);
   // Local-model install state, so the row can offer to download the models when
@@ -90,6 +96,24 @@
       .sort((a, b) => b.startTime - a.startTime),
   );
   const visibleNew = $derived(visible.filter((r) => !r.downloaded));
+  // Saved-but-not-yet-transcribed rows: everything the queue can process.
+  const transcribable = $derived(
+    recordings.filter((r) => r.downloaded && !r.localTranscript),
+  );
+  const queueable = $derived(
+    transcribable.filter((r) => transcribeSelected.includes(r.id)),
+  );
+  // Like Download: an explicit selection wins, otherwise the whole tranche.
+  const queueTargets = $derived(queueable.length ? queueable : transcribable);
+  const transcribeLabel = $derived(
+    queue.length ? `Queued ${queueIndex + 1}/${queue.length}…` : `Transcribe (${queueTargets.length})`,
+  );
+  const transcribeDisabled = $derived(
+    queue.length > 0 ||
+      localTranscribing !== null ||
+      downloadingModels ||
+      transcribable.length === 0,
+  );
 
   const lastSyncedLabel = $derived(relativeTime(lastSynced, nowSec));
   const countdownLabel = $derived(
@@ -285,6 +309,67 @@
     selected = selected.includes(id) ? selected.filter((x) => x !== id) : [...selected, id];
   }
 
+  function toggleTranscribe(id: string) {
+    transcribeSelected = transcribeSelected.includes(id)
+      ? transcribeSelected.filter((x) => x !== id)
+      : [...transcribeSelected, id];
+  }
+
+  // Run the local pipeline over many recordings without babysitting: the
+  // targets run one at a time (the backend serializes anyway), each item's
+  // own failure only drops that item, and Cancel stops the whole queue.
+  async function transcribeQueue() {
+    const items = queueTargets;
+    if (!items.length || queue.length || localTranscribing) return;
+    error = "";
+    queue = items;
+    queueIndex = 0;
+    queueCancel = false;
+    transcribeSelected = [];
+    let done = 0;
+    const failures: string[] = [];
+    try {
+      await ensureModelsInstalled();
+      for (let i = 0; i < items.length; i++) {
+        if (queueCancel) break;
+        queueIndex = i;
+        const recording = items[i];
+        localTranscribing = recording.id;
+        localProgress = {
+          recordingId: recording.id,
+          filename: recording.filename,
+          percent: 0,
+          stage: "Starting local transcription…",
+        };
+        try {
+          await api.transcribeRecording(recording);
+          done += 1;
+        } catch (e) {
+          const message = String(e);
+          if (message.toLowerCase().includes("cancel")) {
+            queueCancel = true;
+            break;
+          }
+          failures.push(recording.filename);
+        }
+      }
+    } catch (e) {
+      error = String(e); // e.g. model download failed or was cancelled
+    } finally {
+      const cancelled = queueCancel;
+      localTranscribing = null;
+      localProgress = null;
+      queue = [];
+      queueIndex = 0;
+      status = cancelled
+        ? "Queued transcription cancelled."
+        : `Queued transcription finished: ${done} saved${
+            failures.length ? ` · ${failures.length} failed: ${failures.join(", ")}` : ""
+          }`;
+      if (done) await refreshList();
+    }
+  }
+
   function reveal(recording: Recording) {
     if (recording.downloaded) void api.revealRecording(recording);
   }
@@ -321,6 +406,8 @@
 
   async function cancelTranscription() {
     try {
+      // Stop the queue loop too, not just the item in flight.
+      queueCancel = true;
       // Cancel whichever phase is active — model download or transcription.
       if (downloadingModels) await api.cancelLocalModelDownload();
       await api.cancelLocalTranscription();
@@ -489,15 +576,38 @@
     >
       {downloadLabel}
     </button>
+    <button
+      class="btn btn-secondary btn-sm"
+      onclick={() => void transcribeQueue()}
+      disabled={transcribeDisabled}
+      title={queue.length
+        ? "Queue is running"
+        : "Transcribe selected saved recordings one after another (all of them when none are selected)"}
+    >
+      {transcribeLabel}
+    </button>
   </div>
 
-  {#if showChecks && visibleNew.length > 0}
+  {#if (showChecks && visibleNew.length > 0) || transcribable.length > 0}
     <div class="select-bar">
-      <button class="link-button" onclick={() => (selected = visibleNew.map((r) => r.id))}>
-        Select all new ({visibleNew.length})
-      </button>
-      {#if selected.length}
-        <button class="link-button" onclick={() => (selected = [])}>Clear</button>
+      {#if showChecks && visibleNew.length > 0}
+        <button class="link-button" onclick={() => (selected = visibleNew.map((r) => r.id))}>
+          Select all new ({visibleNew.length})
+        </button>
+        {#if selected.length}
+          <button class="link-button" onclick={() => (selected = [])}>Clear</button>
+        {/if}
+      {/if}
+      {#if transcribable.length > 0}
+        <button
+          class="link-button"
+          onclick={() => (transcribeSelected = transcribable.map((r) => r.id))}
+        >
+          Select all to transcribe ({transcribable.length})
+        </button>
+        {#if transcribeSelected.length}
+          <button class="link-button" onclick={() => (transcribeSelected = [])}>Clear transcribe</button>
+        {/if}
       {/if}
     </div>
   {/if}
@@ -525,13 +635,19 @@
   {#if localProgress}
     <div class="progress-wrap local-progress">
       <div class="progress-bar">
-        <div style={`width: ${localProgress.percent}%`}></div>
+        <div
+          class:estimating={localProgress.stage.startsWith("Identifying speakers")}
+          style={`width: ${localProgress.percent}%`}
+        ></div>
       </div>
       <div class="progress-foot">
-        <p class="meta">{localProgress.stage} · {localProgress.filename} · {localProgress.percent}%</p>
+        <p class="meta">
+          {localProgress.stage} · {localProgress.filename} · {localProgress.percent}%{#if queue.length}
+            · queued {queueIndex + 1}/{queue.length}{/if}
+        </p>
         {#if localTranscribing}
           <button class="btn btn-ghost btn-sm" onclick={() => void cancelTranscription()}>
-            Cancel
+            {queue.length > 1 ? "Cancel queue" : "Cancel"}
           </button>
         {/if}
       </div>
@@ -567,12 +683,30 @@
             }}
             title="Reveal in Finder"
           >
-            <span class="dot done"></span>
+            {#if recording.downloaded && !recording.localTranscript}
+              <input
+                type="checkbox"
+                checked={transcribeSelected.includes(recording.id)}
+                onchange={() => toggleTranscribe(recording.id)}
+              />
+            {:else}
+              <span class="dot done"></span>
+            {/if}
             <span class="rec-name">{recording.filename}</span>
             <span class="rec-meta">
               {formatDate(recording.startTime)} · {formatDuration(recording.duration)}{#if recording.isTrans} · TXT{/if}{#if recording.localTranscript} · Local TXT{/if}
             </span>
-            <span class="rec-state done">{recording.localTranscript ? "Transcribed" : "Saved"}</span>
+            <span class="rec-state done">
+              {#if localTranscribing === recording.id}
+                Transcribing…
+              {:else if queue.some((q) => q.id === recording.id)}
+                Queued
+              {:else if recording.localTranscript}
+                Transcribed
+              {:else}
+                Saved
+              {/if}
+            </span>
             {#if recording.localTranscript}
               <button
                 class="btn btn-ghost btn-sm transcribe-btn"
@@ -612,7 +746,7 @@
                   event.stopPropagation();
                   void transcribe(recording);
                 }}
-                disabled={localTranscribing !== null}
+                disabled={localTranscribing !== null || queue.length > 0}
                 title="Transcribe with the local Parakeet model"
               >
                 Transcribe
@@ -910,6 +1044,27 @@
   }
   .local-progress {
     margin-top: 8px;
+  }
+  /* Diarization has no real percent between 78–92 (single FFI call), so the
+     bar shimmers to show the run is alive rather than frozen. */
+  .progress-bar > div {
+    position: relative;
+    overflow: hidden;
+  }
+  .progress-bar > div.estimating::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.35), transparent);
+    animation: progress-shimmer 1.4s infinite;
+  }
+  @keyframes progress-shimmer {
+    from {
+      transform: translateX(-100%);
+    }
+    to {
+      transform: translateX(100%);
+    }
   }
   .progress-foot {
     display: flex;
