@@ -7,6 +7,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The app updates itself from the rolling `plaud-sync-latest` GitHub release; the
 notes for each published version are taken from this file.
 
+## [0.4.8] - 2026-09-25
+
+### Added
+- Choose your local transcription model in Settings — Parakeet TDT 0.6B v3
+  (default, fast) or Whisper Large v3 (best accuracy for accented/non-native
+  English). Per-model cards show size, install state, and download/remove.
+- Sync and download steps are logged — recordings listed, the reason each file
+  was skipped (already on disk, no transcript yet, isTrans=false), and each
+  successful download with its destination path — so a recording that was
+  listed but never downloaded can be traced.
+
+### Fixed
+- Token refresh no longer gets stuck in a 401 loop for accounts whose session
+  was adopted from web.plaud.ai while the stored region was wrong. Plaud replies
+  `200 OK` with an in-body region redirect (and no cookie); the refresh handler
+  now parses the body, follows the redirect, and persists the corrected region.
+- Session-refresh failures now surface Plaud's in-body message in the log and
+  tell the user to sign in again, instead of logging only the HTTP status.
+- Auto-sync backs off repeated failures (1 min → 5 min → 15 min → hourly)
+  instead of retrying every 60 seconds forever after a hard auth error.
+- A `config.json` missing any settings key (e.g. written by an older build) no
+  longer silently resets the whole settings block and credentials.
+
 ## [0.4.7] - 2026-09-10
 
 ### Fixed
