@@ -2,16 +2,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tauri::{AppHandle, Manager, Runtime, State, Url, WebviewUrl, WebviewWindowBuilder};
-use tauri::WindowEvent;
 use tauri::webview::NewWindowResponse;
+use tauri::WindowEvent;
+use tauri::{AppHandle, Manager, Runtime, State, Url, WebviewUrl, WebviewWindowBuilder};
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 
 use crate::app_types::AuthStatus;
 use crate::login_log;
-use crate::state::{AppState, BrowserLogin};
 use crate::plaud::{PlaudAuth, PlaudClient, SsoSession};
+use crate::state::{AppState, BrowserLogin};
 use crate::storage::Storage;
 
 const LOGIN_WINDOW_LABEL: &str = "plaud-login";
@@ -341,10 +341,7 @@ pub async fn login_with_browser<R: Runtime>(
     let (tx, rx) = oneshot::channel::<Result<BrowserLogin, String>>();
 
     {
-        let mut slot = state
-            .browser_login_tx
-            .lock()
-            .map_err(|e| e.to_string())?;
+        let mut slot = state.browser_login_tx.lock().map_err(|e| e.to_string())?;
         *slot = Some(tx);
     }
 
@@ -417,7 +414,10 @@ pub async fn login_with_browser<R: Runtime>(
                 return;
             }
             login_log::warn("sign-in window closed by user");
-            resolve_login(&app_for_close, Err("Sign-in window closed before login completed.".to_string()));
+            resolve_login(
+                &app_for_close,
+                Err("Sign-in window closed before login completed.".to_string()),
+            );
         }
     });
 
@@ -615,7 +615,10 @@ async fn complete_session_cookie(
         let _ = storage.save_display_name(&user.nickname);
     }
 
-    login_log::info(&format!("session-cookie sign-in complete for {}", user.email));
+    login_log::info(&format!(
+        "session-cookie sign-in complete for {}",
+        user.email
+    ));
 
     Ok(AuthStatus {
         logged_in: true,
