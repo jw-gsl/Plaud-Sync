@@ -17,6 +17,11 @@ pub enum EngineKind {
     /// OpenAI Whisper ONNX: stronger on accented/non-native English, but
     /// the ONNX graph only accepts 30-second windows and it is slower.
     Whisper,
+    /// `parakeet-mlx` running over a helper sidecar process on the Apple GPU
+    /// via MLX (macOS + Apple Silicon only). Model + runtime are NOT managed
+    /// by this store: the helper downloads them itself, so install/validate
+    /// for this engine checks the cache instead of pinned files.
+    MlxSidecar,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -79,6 +84,59 @@ const PARAKEET_FILES: &[ModelFile] = &[
     },
 ];
 
+pub const MLX_MODEL_ID: &str = "mlx-community/parakeet-tdt-0.6b-v2";
+pub const MLX_SIDECAR_NAME: &str = "plaud-mlx-transcribe";
+
+/// Registered but hidden unless macOS + Apple Silicon.
+const MLX_FILES: &[ModelFile] = &[];
+
+/// Sidecar helper location, first match wins:
+/// 1. `PLAUD_MLX_SIDECAR` env override (dev/testing)
+/// 2. next to the current executable (bundled sidecar layout)
+/// 3. dev tree: `src-tauri/binaries/plaud-mlx-transcribe-<target-triple>`
+pub fn resolve_mlx_sidecar() -> Option<PathBuf> {
+    if let Ok(override_path) = std::env::var("PLAUD_MLX_SIDECAR") {
+        let path = PathBuf::from(override_path);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join(MLX_SIDECAR_NAME);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("binaries")
+        .join(format!("{MLX_SIDECAR_NAME}-aarch64-apple-darwin"));
+    dev.is_file().then_some(dev)
+}
+
+/// Hugging Face cache dir the helper populates for the MLX model (~2.3 GB).
+pub fn mlx_model_cache_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(
+        PathBuf::from(home)
+            .join(".cache/huggingface/hub")
+            .join(format!("models--{}", MLX_MODEL_ID.replace('/', "--"))),
+    )
+}
+
+fn is_mlx_ready() -> bool {
+    resolve_mlx_sidecar().is_some() && mlx_model_cache_dir().is_some_and(|dir| dir.is_dir())
+}
+
+/// Whether this model can be offered at all on this machine.
+pub fn is_model_offered(spec: &ModelSpec) -> bool {
+    match spec.engine {
+        EngineKind::MlxSidecar => cfg!(all(target_os = "macos", target_arch = "aarch64")),
+        _ => true,
+    }
+}
+
 // Checksums verified against the full files downloaded from the pinned
 // commit on 2026-09-25.
 const WHISPER_FILES: &[ModelFile] = &[
@@ -121,6 +179,15 @@ pub const MODEL_SPECS: &[ModelSpec] = &[
         repo: "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-large-v3",
         revision: "2a6507094dd6020d939d78e3f1834a1d06267fca",
         files: WHISPER_FILES,
+    },
+    ModelSpec {
+        id: "parakeet-mlx-gpu",
+        name: "Parakeet v2 (MLX, Apple GPU)",
+        description: "Fastest on Apple Silicon Macs: runs on the GPU, a 30-minute recording transcribes in well under a minute. English only. The ~2.3 GB model is downloaded on first use.",
+        engine: EngineKind::MlxSidecar,
+        repo: "",
+        revision: "",
+        files: MLX_FILES,
     },
 ];
 
@@ -203,6 +270,9 @@ pub struct LocalModelStatus {
     pub size_mb: u64,
     pub model_dir: String,
     pub is_default: bool,
+    /// False when this model can't run on this machine at all (e.g. the MLX
+    /// helper on Windows). Hidden from the picker.
+    pub available: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -216,6 +286,24 @@ pub struct ModelDownloadProgress {
 }
 
 pub fn model_status(app_data_dir: &Path, spec: &'static ModelSpec) -> LocalModelStatus {
+    if matches!(spec.engine, EngineKind::MlxSidecar) {
+        return LocalModelStatus {
+            id: spec.id.to_string(),
+            revision: "managed-by-helper".to_string(),
+            name: spec.name.to_string(),
+            description: spec.description.to_string(),
+            installed: is_mlx_ready(),
+            downloading: false,
+            downloaded_bytes: 0,
+            total_bytes: 0,
+            size_mb: 2400,
+            model_dir: mlx_model_cache_dir()
+                .map(|dir| dir.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            is_default: spec.id == DEFAULT_MODEL_ID,
+            available: is_model_offered(spec),
+        };
+    }
     let dir = model_dir(app_data_dir, spec);
     let total = spec.files.iter().map(|f| f.size).sum();
     let downloaded = spec
@@ -238,6 +326,7 @@ pub fn model_status(app_data_dir: &Path, spec: &'static ModelSpec) -> LocalModel
         size_mb: (total / 1_000_000) + 1,
         model_dir: dir.to_string_lossy().to_string(),
         is_default: spec.id == DEFAULT_MODEL_ID,
+        available: is_model_offered(spec),
     }
 }
 
@@ -306,6 +395,9 @@ pub fn pipeline_model_paths(app_data_dir: &Path) -> Option<PipelineModelPaths> {
 }
 
 pub fn is_model_ready(app_data_dir: &Path, spec: &ModelSpec) -> bool {
+    if matches!(spec.engine, EngineKind::MlxSidecar) {
+        return is_mlx_ready();
+    }
     let dir = model_dir(app_data_dir, spec);
     spec.files.iter().all(|file| {
         let path = dir.join(file.name);
@@ -351,6 +443,9 @@ pub async fn download_model(
     spec: &'static ModelSpec,
     cancelled: &AtomicBool,
 ) -> Result<LocalModelStatus, String> {
+    if matches!(spec.engine, EngineKind::MlxSidecar) {
+        return warm_mlx_model(app, spec, cancelled).await;
+    }
     let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let dir = model_dir(&app_data, spec);
     tokio::fs::create_dir_all(&dir)
@@ -458,6 +553,16 @@ pub async fn download_model(
 }
 
 pub async fn delete_model(app: &AppHandle, spec: &ModelSpec) -> Result<(), String> {
+    if matches!(spec.engine, EngineKind::MlxSidecar) {
+        let dir = mlx_model_cache_dir()
+            .ok_or_else(|| "Could not locate the Hugging Face cache directory.".to_string())?;
+        if dir.exists() {
+            tokio::fs::remove_dir_all(&dir)
+                .await
+                .map_err(|e| format!("Could not delete the MLX model cache: {e}"))?;
+        }
+        return Ok(());
+    }
     let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let dir = model_dir(&app_data, spec);
     if dir.exists() {
@@ -466,6 +571,55 @@ pub async fn delete_model(app: &AppHandle, spec: &ModelSpec) -> Result<(), Strin
             .map_err(|e| format!("Could not delete model: {e}"))?;
     }
     Ok(())
+}
+
+/// "Install" for the MLX engine: run the helper once with `--warm` so it
+/// downloads and loads the model. There is no byte progress to report —
+/// `hf_hub` streams to its own cache — so the event just names the step.
+async fn warm_mlx_model(
+    app: &AppHandle,
+    spec: &'static ModelSpec,
+    cancelled: &AtomicBool,
+) -> Result<LocalModelStatus, String> {
+    let sidecar = resolve_mlx_sidecar().ok_or_else(|| {
+        "The MLX helper is not installed with this build (see scripts/build-mlx-sidecar.sh)."
+            .to_string()
+    })?;
+    let _ = app.emit(
+        "local-model-progress",
+        ModelDownloadProgress {
+            file: format!("Downloading {MLX_MODEL_ID} from Hugging Face…"),
+            downloaded_bytes: 0,
+            total_bytes: 1,
+            downloaded_total: 0,
+            total: 1,
+        },
+    );
+    let mut child = tokio::process::Command::new(&sidecar)
+        .arg("--warm")
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("Could not start the MLX helper: {e}"))?;
+    let status = loop {
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(status) => break status,
+            None => {
+                if cancelled.load(Ordering::Acquire) {
+                    let _ = child.start_kill();
+                    return Err("Model download cancelled".to_string());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+        }
+    };
+    if !status.success() {
+        return Err(format!(
+            "The MLX helper failed while preparing {} (exit {status:?}).",
+            MLX_MODEL_ID
+        ));
+    }
+    let app_data = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    Ok(model_status(&app_data, spec))
 }
 
 pub async fn download_pipeline_model(

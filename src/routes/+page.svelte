@@ -8,6 +8,7 @@
   import {
     checkForUpdate,
     downloadAndInstall,
+    friendlyUpdateError,
     relaunch,
     type Update,
     type UpdateStatus,
@@ -69,7 +70,10 @@
       });
       update = { kind: "ready" };
     } catch (e) {
-      update = { kind: "error", message: String(e) };
+      // Keep the raw string (with the bare `os error <code>`) in the debug log
+      // and show the mapped guidance in the UI.
+      void api.logClientError(`update install failed: ${e instanceof Error ? e.stack ?? e.message : String(e)}`);
+      update = { kind: "error", message: friendlyUpdateError(e) };
     }
   }
 
@@ -77,7 +81,7 @@
     try {
       await relaunch();
     } catch (e) {
-      update = { kind: "error", message: String(e) };
+      update = { kind: "error", message: friendlyUpdateError(e) };
     }
   }
 

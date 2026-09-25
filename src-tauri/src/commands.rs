@@ -496,7 +496,7 @@ pub(crate) async fn auto_transcribe_new(app: &AppHandle) -> usize {
     };
     let deleted = storage.get_deleted_ids();
     let root = std::path::PathBuf::from(&settings.download_dir);
-    let pending: Vec<PlaudRecording> = recordings
+    let mut pending: Vec<PlaudRecording> = recordings
         .into_iter()
         .filter(|r| {
             if deleted.contains(&r.id) {
@@ -508,6 +508,9 @@ pub(crate) async fn auto_transcribe_new(app: &AppHandle) -> usize {
             downloaded && !transcribed
         })
         .collect();
+    // Drain a backlog oldest-first: Plaud's list is newest-first, which would
+    // otherwise make every new download cut in front of the backlog forever.
+    pending.sort_by_key(|recording| recording.start_time);
     if pending.is_empty() {
         return 0;
     }
@@ -798,6 +801,13 @@ pub fn open_download_folder(state: State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 pub fn open_login_debug_log() -> Result<(), String> {
     crate::browser_login::open_debug_log()
+}
+
+/// Write a client-side (JS) error into the same debug log used by login, so
+/// reports like "update failed with OS error" can be checked later.
+#[tauri::command]
+pub fn log_client_error(message: String) {
+    crate::login_log::warn(&format!("client: {message}"));
 }
 
 #[tauri::command]

@@ -26,3 +26,6 @@ vite.config.ts.timestamp-*
 
 # Windows crash dumps (local diagnostics only)
 /crash_dumps/
+
+# Built by scripts/build-mlx-sidecar.sh per release
+/src-tauri/binaries/
