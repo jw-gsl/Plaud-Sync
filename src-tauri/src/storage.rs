@@ -13,11 +13,23 @@ const REFRESH_TOKEN_ACCOUNT: &str = "plaud-refresh-token";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
+    // Every field is `#[serde(default)]` on purpose: a `config.json` written by
+    // an older build (or hand-edited) may be missing keys, and without a default
+    // a single missing key fails the WHOLE `StoredConfig` parse — which then
+    // silently resets settings AND credentials to defaults (see `Storage::load`).
+    // Defaulting each field lets a partial settings object deserialize and keep
+    // whatever it does have, so nothing is lost on upgrade or a stray edit.
+    #[serde(default = "default_download_dir")]
     pub download_dir: String,
+    #[serde(default = "default_folder_structure")]
     pub folder_structure: String,
+    #[serde(default = "default_custom_prefix")]
     pub custom_prefix: String,
+    #[serde(default = "default_filename_style")]
     pub filename_style: String,
+    #[serde(default = "default_true")]
     pub create_info_txt: bool,
+    #[serde(default = "default_true")]
     pub download_transcript: bool,
     #[serde(default)]
     pub auto_sync: bool,
@@ -31,6 +43,28 @@ pub struct AppSettings {
     pub local_transcription: bool,
     #[serde(default = "default_auto_transcribe")]
     pub auto_transcribe: bool,
+    #[serde(default = "default_transcription_model")]
+    pub transcription_model: String,
+}
+
+fn default_transcription_model() -> String {
+    crate::transcription::model_store::DEFAULT_MODEL_ID.to_string()
+}
+
+fn default_folder_structure() -> String {
+    "by_date".to_string()
+}
+
+fn default_custom_prefix() -> String {
+    "PlaudRecordings".to_string()
+}
+
+fn default_filename_style() -> String {
+    "clean".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_auto_sync_minutes() -> u32 {
@@ -53,17 +87,18 @@ impl Default for AppSettings {
     fn default() -> Self {
         Self {
             download_dir: default_download_dir(),
-            folder_structure: "by_date".to_string(),
-            custom_prefix: "PlaudRecordings".to_string(),
-            filename_style: "clean".to_string(),
-            create_info_txt: true,
-            download_transcript: true,
+            folder_structure: default_folder_structure(),
+            custom_prefix: default_custom_prefix(),
+            filename_style: default_filename_style(),
+            create_info_txt: default_true(),
+            download_transcript: default_true(),
             auto_sync: false,
             auto_sync_minutes: default_auto_sync_minutes(),
             theme: default_theme(),
             start_minimized: false,
             local_transcription: default_local_transcription(),
             auto_transcribe: default_auto_transcribe(),
+            transcription_model: default_transcription_model(),
         }
     }
 }
@@ -104,7 +139,19 @@ impl Storage {
 
     fn load(&self) -> StoredConfig {
         match fs::read_to_string(&self.config_path) {
-            Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
+            Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
+                // A parse failure here silently discards the ENTIRE config —
+                // settings, credentials, token — and the next save writes those
+                // defaults back to disk, so a single unparseable field wipes the
+                // user's setup and logs them out. Every field is now defaulted to
+                // make this near-impossible, but if it still happens, leave a
+                // breadcrumb rather than resetting in silence.
+                crate::login_log::error(&format!(
+                    "config.json failed to parse ({e}) — falling back to defaults. \
+                     Existing settings/credentials may be reset on the next save."
+                ));
+                StoredConfig::default()
+            }),
             Err(_) => StoredConfig::default(),
         }
     }
@@ -249,6 +296,19 @@ impl Storage {
             .map(|c| c.region)
             .unwrap_or_else(|| "us".to_string())
     }
+
+    /// Update just the region on the stored credentials — used when Plaud
+    /// redirects us to the account's real region after sign-in.
+    pub fn save_region(&self, region: &str) -> Result<(), std::io::Error> {
+        let mut config = self.load();
+        if let Some(creds) = config.credentials.as_mut() {
+            if creds.region != region {
+                creds.region = region.to_string();
+                return self.save(&config);
+            }
+        }
+        Ok(())
+    }
 }
 
 fn default_download_dir() -> String {
@@ -256,4 +316,77 @@ fn default_download_dir() -> String {
         .or_else(dirs::home_dir)
         .map(|p| p.join("PlaudRecordings").to_string_lossy().to_string())
         .unwrap_or_else(|| "PlaudRecordings".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_settings_deserializes_from_empty_object() {
+        // A `settings: {}` must yield full defaults, not a parse error.
+        let s: AppSettings = serde_json::from_str("{}").expect("empty settings should parse");
+        assert_eq!(s.custom_prefix, "PlaudRecordings");
+        assert_eq!(s.folder_structure, "by_date");
+        assert_eq!(s.filename_style, "clean");
+        assert!(s.create_info_txt);
+        assert!(s.download_transcript);
+    }
+
+    #[test]
+    fn partial_settings_keeps_present_fields_and_defaults_the_rest() {
+        // The user's workaround config: every field EXCEPT customPrefix. Before
+        // the fix this failed to parse (customPrefix was required), which reset
+        // the whole config. Now it must parse, keep the real values, and default
+        // only the missing key.
+        let json = r#"{
+            "downloadDir": "C:\\Users\\ellen\\OneDrive\\PlaudRecordings",
+            "folderStructure": "by_date",
+            "filenameStyle": "clean",
+            "createInfoTxt": true,
+            "downloadTranscript": true,
+            "autoSync": true
+        }"#;
+        let s: AppSettings = serde_json::from_str(json).expect("partial settings should parse");
+        assert_eq!(
+            s.download_dir,
+            "C:\\Users\\ellen\\OneDrive\\PlaudRecordings"
+        );
+        assert!(
+            s.auto_sync,
+            "autoSync must survive — not silently reset to false"
+        );
+        assert_eq!(s.custom_prefix, "PlaudRecordings"); // defaulted, not a parse failure
+    }
+
+    #[test]
+    fn stored_config_with_partial_settings_preserves_credentials() {
+        // The crux of the "settings reset to null on sign-in" bug: a config whose
+        // settings object is missing a field must NOT take down the credentials
+        // with it. The whole StoredConfig has to still deserialize.
+        let json = r#"{
+            "credentials": { "email": "ellen@example.com", "region": "eu" },
+            "settings": { "downloadDir": "/data", "autoSync": true }
+        }"#;
+        let cfg: StoredConfig =
+            serde_json::from_str(json).expect("config with partial settings must parse");
+        let creds = cfg
+            .credentials
+            .expect("credentials must survive a partial settings object");
+        assert_eq!(creds.email, "ellen@example.com");
+        let settings = cfg
+            .settings
+            .expect("settings must be preserved, not dropped");
+        assert!(settings.auto_sync);
+        assert_eq!(settings.download_dir, "/data");
+    }
+
+    #[test]
+    fn unknown_future_fields_are_ignored_not_fatal() {
+        // Forward-compat: a config written by a NEWER build (extra keys) must not
+        // fail to parse on an older build.
+        let json = r#"{ "settings": { "downloadDir": "/x" }, "somethingBrandNew": 42 }"#;
+        let cfg: StoredConfig = serde_json::from_str(json).expect("unknown keys must be ignored");
+        assert_eq!(cfg.settings.unwrap().download_dir, "/x");
+    }
 }
