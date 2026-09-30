@@ -266,10 +266,19 @@ pub fn transcribe_file(
         None => None,
     };
     let used_diarization = diarization_segments.is_some();
+    // Count *distinct* speaker labels, not the highest label seen. The
+    // clustering stage emits sparse, non-contiguous ids, so `max + 1` badly
+    // overstates the result -- observed as 863 "speakers" on a recording that
+    // only carried 132 distinct labels (and ~8 real participants).
     let speaker_count = diarization_segments
         .as_ref()
-        .and_then(|segments| segments.iter().map(|segment| segment.speaker).max())
-        .map(|speaker| speaker + 1)
+        .map(|segments| {
+            segments
+                .iter()
+                .map(|segment| segment.speaker)
+                .collect::<std::collections::HashSet<_>>()
+                .len() as u32
+        })
         .unwrap_or(0);
     let speaker_segments = asr_segments
         .iter()
