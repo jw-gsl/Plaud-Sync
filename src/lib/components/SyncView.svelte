@@ -679,6 +679,11 @@
             tabindex="0"
             onclick={() => reveal(recording)}
             onkeydown={(event) => {
+              // Ignore key events that originated in a nested control (the
+              // transcribe checkbox): Space there should tick the box, not
+              // also reveal the row in Finder. Only the row itself is
+              // focusable, so target === currentTarget means the row has focus.
+              if (event.target !== event.currentTarget) return;
               if (event.key === "Enter" || event.key === " ") reveal(recording);
             }}
             title="Reveal in Finder"
@@ -687,6 +692,7 @@
               <input
                 type="checkbox"
                 checked={transcribeSelected.includes(recording.id)}
+                onclick={(event) => event.stopPropagation()}
                 onchange={() => toggleTranscribe(recording.id)}
               />
             {:else}
