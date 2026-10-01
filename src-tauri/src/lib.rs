@@ -42,10 +42,12 @@ pub fn run() {
                 // downloads any new recordings within ~60s of launch instead of
                 // waiting a full interval.
                 last_sync_epoch: std::sync::atomic::AtomicI64::new(0),
+                sync_running: std::sync::atomic::AtomicBool::new(false),
                 local_transcription_running: std::sync::atomic::AtomicBool::new(false),
                 local_transcription_cancelled: std::sync::Arc::new(
                     std::sync::atomic::AtomicBool::new(false),
                 ),
+                transcribing_id: std::sync::Mutex::new(None),
                 local_model_download_running: std::sync::atomic::AtomicBool::new(false),
                 local_model_download_cancelled: std::sync::atomic::AtomicBool::new(false),
             });
@@ -105,6 +107,7 @@ pub fn run() {
             commands::open_local_transcript,
             commands::read_local_transcript,
             commands::delete_local_recording,
+            commands::rename_recording,
             commands::log_client_error,
         ])
         .run(tauri::generate_context!())

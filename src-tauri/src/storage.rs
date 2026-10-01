@@ -6,6 +6,18 @@ use serde::{Deserialize, Serialize};
 
 use crate::plaud::types::{PlaudCredentials, PlaudRecording, PlaudTokenData};
 
+/// Serialises every read-modify-write of `recordings.json`. Process-wide
+/// because `Storage` is cloned out of `AppState` for each command, so a lock
+/// on the instance would not be shared.
+static RECORDINGS_CACHE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn cache_lock() -> std::sync::MutexGuard<'static, ()> {
+    // A panic while holding the lock leaves only a () behind; keep going.
+    RECORDINGS_CACHE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 const SERVICE_NAME: &str = "com.jameswhiting.plaud-sync";
 const PASSWORD_ACCOUNT: &str = "plaud-password";
 const REFRESH_TOKEN_ACCOUNT: &str = "plaud-refresh-token";
@@ -242,20 +254,94 @@ impl Storage {
     /// Cached recordings list (metadata only; downloaded state is re-derived
     /// from disk on read). Lets the UI render instantly and survive a failed
     /// or offline refresh.
+    ///
+    /// A fresh API listing never carries `local_basename`, so a basename the
+    /// cache already holds is kept rather than overwritten with `None`: a sync
+    /// pass may have recorded one while this listing was in flight.
     pub fn save_recordings_cache(
         &self,
         recordings: &[PlaudRecording],
     ) -> Result<(), std::io::Error> {
-        let raw = serde_json::to_string(recordings)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-        fs::write(self.cache_path(), raw)
+        let _lock = cache_lock();
+        let cached = self.read_recordings_cache();
+        let merged: Vec<PlaudRecording> = recordings
+            .iter()
+            .map(|recording| {
+                let mut recording = recording.clone();
+                if recording.local_basename.is_none() {
+                    recording.local_basename = cached
+                        .iter()
+                        .find(|c| c.id == recording.id)
+                        .and_then(|c| c.local_basename.clone());
+                }
+                recording
+            })
+            .collect();
+        self.write_recordings_cache(&merged)
     }
 
     pub fn get_recordings_cache(&self) -> Vec<PlaudRecording> {
+        let _lock = cache_lock();
+        self.read_recordings_cache()
+    }
+
+    fn read_recordings_cache(&self) -> Vec<PlaudRecording> {
         match fs::read_to_string(self.cache_path()) {
             Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
             Err(_) => Vec::new(),
         }
+    }
+
+    /// Read-modify-write the recordings cache under the process-wide cache
+    /// lock. `edit` returns whether it changed anything; the file is only
+    /// rewritten when it did.
+    ///
+    /// Every writer goes through the lock because the read-modify-write is
+    /// otherwise lost-update prone: a UI refresh overlapping a sync pass could
+    /// put back a stale basename, and the next pass would re-download.
+    pub fn edit_recordings_cache<R>(
+        &self,
+        edit: impl FnOnce(&mut Vec<PlaudRecording>) -> (R, bool),
+    ) -> Result<R, std::io::Error> {
+        let _lock = cache_lock();
+        let mut cached = self.read_recordings_cache();
+        let (result, changed) = edit(&mut cached);
+        if changed {
+            self.write_recordings_cache(&cached)?;
+        }
+        Ok(result)
+    }
+
+    /// Record the on-disk basename for a recording.
+    ///
+    /// The API response never carries it, so without this the id-keyed path
+    /// would be forgotten on the next refresh and the app would fall back to
+    /// deriving the path from the cloud title — the bug this field exists to
+    /// fix. No-op when the recording is not cached yet (`list_recordings`
+    /// persists it on the next pass).
+    pub fn set_local_basename(&self, id: &str, basename: &str) -> Result<(), std::io::Error> {
+        self.edit_recordings_cache(|cached| {
+            let Some(recording) = cached.iter_mut().find(|r| r.id == id) else {
+                return ((), false);
+            };
+            if recording.local_basename.as_deref() == Some(basename) {
+                return ((), false);
+            }
+            recording.local_basename = Some(basename.to_string());
+            ((), true)
+        })
+    }
+
+    fn write_recordings_cache(&self, recordings: &[PlaudRecording]) -> Result<(), std::io::Error> {
+        let raw = serde_json::to_vec(recordings)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        fs::write(self.cache_path(), raw)
+    }
+
+    /// The cached entry for a recording id: the last title and on-disk
+    /// basename this app knows about, which the UI's copy may not match.
+    pub fn cached_recording(&self, id: &str) -> Option<PlaudRecording> {
+        self.get_recordings_cache().into_iter().find(|r| r.id == id)
     }
 
     pub fn get_settings(&self) -> AppSettings {

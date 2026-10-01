@@ -139,6 +139,13 @@ pub async fn list_recordings(state: State<'_, AppState>) -> Result<Vec<PlaudReco
     let mut client = PlaudClient::new(auth, region);
 
     let mut recordings = client.list_recordings().await?;
+    // The API listing carries no local state; re-attach the id-keyed on-disk
+    // basename and mirror any web/phone rename before deriving any flags.
+    // This must run here and not only in the sync pass: this listing is saved
+    // over the cache below, so a rename it saw would otherwise never be seen
+    // again.
+    let busy = state.transcribing_id();
+    crate::sync::reconcile_listing(&storage, &settings, &mut recordings, busy.as_deref());
     mark_downloaded_status(&mut recordings, &settings);
     mark_local_transcript_status(&mut recordings, &settings);
     // Hide locally-deleted recordings so they don't reappear after a resync.
@@ -374,6 +381,7 @@ pub(crate) async fn transcribe_recording_inner(
         );
     }
     let _permit = TranscriptionPermit(&state.local_transcription_running);
+    let _busy = TranscribingId::claim(&state.transcribing_id, &recording.id);
     // Clear any cancellation left over from a previous run before we start.
     state
         .local_transcription_cancelled
@@ -399,12 +407,37 @@ pub(crate) async fn transcribe_recording_inner(
         ));
     }
 
+    // The caller's copy can predate a rename (the UI row, or an auto pass's
+    // queue built before an earlier item finished), so resolve by the cache's
+    // basename for this id.
+    let mut recording = recording.clone();
+    if let Some(basename) = storage
+        .cached_recording(&recording.id)
+        .and_then(|cached| cached.local_basename)
+    {
+        recording.local_basename = Some(basename);
+    }
+    let recording = &recording;
     let root = std::path::PathBuf::from(&settings.download_dir);
-    let base = crate::sync::build_audio_path(&root, recording, &settings);
-    let audio_path = [base.clone(), base.with_extension("opus")]
-        .into_iter()
-        .find(|path| path.is_file())
+    let base = crate::sync::resolve_local_base(&root, recording, &settings);
+    let audio_path = crate::sync::local_audio(&base)
         .ok_or_else(|| "Download this recording before transcribing it locally.".to_string())?;
+
+    // Transcriptions can run for hours, so the log needs to show that a run is
+    // alive and advancing. Without this, "slow" and "wedged" look identical
+    // from outside the process.
+    let started = std::time::Instant::now();
+    crate::login_log::info(&format!(
+        "transcribe start: \"{}\" (id {}) model={} audio={:.1} min file={}",
+        recording.filename,
+        recording.id,
+        spec.id,
+        recording.duration as f64 / 60_000.0,
+        audio_path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default(),
+    ));
 
     let emit_progress = |percent: u8, stage: &str| {
         let _ = app.emit(
@@ -428,6 +461,10 @@ pub(crate) async fn transcribe_recording_inner(
     let recording_id_for_emit = recording.id.clone();
     let filename_for_emit = recording.filename.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
+        // Log every stage change, plus a heartbeat every 30s: a single stage
+        // (diarization on a long recording) can run for many minutes with no
+        // other output, which is what made long runs look hung.
+        let last_logged = std::sync::Mutex::new((String::new(), started));
         let progress = |percent: u8, stage: &str| {
             let _ = app_for_worker.emit(
                 "local-transcription-progress",
@@ -438,6 +475,17 @@ pub(crate) async fn transcribe_recording_inner(
                     stage: stage.to_string(),
                 },
             );
+            if let Ok(mut last) = last_logged.lock() {
+                let stage_changed = last.0 != stage;
+                let heartbeat_due = last.1.elapsed() >= std::time::Duration::from_secs(30);
+                if stage_changed || heartbeat_due {
+                    crate::login_log::info(&format!(
+                        "transcribe progress: {percent}% {stage} ({})",
+                        format_elapsed(started.elapsed())
+                    ));
+                    *last = (stage.to_string(), std::time::Instant::now());
+                }
+            }
         };
         crate::transcription::transcribe_file(
             &audio_for_worker,
@@ -449,9 +497,27 @@ pub(crate) async fn transcribe_recording_inner(
         )
     })
     .await
-    .map_err(|e| format!("Local transcription worker failed: {e}"))??;
-    emit_progress(100, "Transcript saved");
-    Ok(result)
+    .map_err(|e| format!("Local transcription worker failed: {e}"))?;
+    match &result {
+        Ok(transcript) => {
+            crate::login_log::info(&format!(
+                "transcribe done: \"{}\" in {} ({} chars, {} speaker(s), vad={}, diarization={})",
+                recording.filename,
+                format_elapsed(started.elapsed()),
+                transcript.text.chars().count(),
+                transcript.speaker_count,
+                transcript.used_vad,
+                transcript.used_diarization
+            ));
+            emit_progress(100, "Transcript saved");
+        }
+        Err(e) => crate::login_log::warn(&format!(
+            "transcribe failed: \"{}\" after {}: {e}",
+            recording.filename,
+            format_elapsed(started.elapsed())
+        )),
+    }
+    result
 }
 
 /// Ask a running local transcription to stop. The blocking worker polls the
@@ -491,9 +557,14 @@ pub(crate) async fn auto_transcribe_new(app: &AppHandle) -> usize {
 
     // Fresh list from Plaud so newly-downloaded recordings are included.
     let mut client = PlaudClient::new(PlaudAuth::new(storage.clone()), storage.get_region());
-    let Ok(recordings) = client.list_recordings().await else {
+    let Ok(mut recordings) = client.list_recordings().await else {
         return 0;
     };
+    // Re-attach the id-keyed local basenames (and mirror renames): a fresh
+    // listing has no local state, and without this a renamed recording's files
+    // look absent here and are never picked up for transcription.
+    let busy = state.transcribing_id();
+    crate::sync::reconcile_listing(&storage, &settings, &mut recordings, busy.as_deref());
     let deleted = storage.get_deleted_ids();
     let root = std::path::PathBuf::from(&settings.download_dir);
     let mut pending: Vec<PlaudRecording> = recordings
@@ -502,18 +573,28 @@ pub(crate) async fn auto_transcribe_new(app: &AppHandle) -> usize {
             if deleted.contains(&r.id) {
                 return false;
             }
-            let base = crate::sync::build_audio_path(&root, r, &settings);
-            let downloaded = base.exists() || base.with_extension("opus").exists();
-            let transcribed = base.with_extension("local.txt").exists();
+            let base = crate::sync::resolve_local_base(&root, r, &settings);
+            // Audio specifically: a lone Plaud .txt is not something to transcribe.
+            let downloaded = crate::sync::local_audio(&base).is_some();
+            let transcribed = crate::sync::local_file(&base, ".local.txt").exists();
             downloaded && !transcribed
         })
         .collect();
-    // Drain a backlog oldest-first: Plaud's list is newest-first, which would
-    // otherwise make every new download cut in front of the backlog forever.
-    pending.sort_by_key(|recording| recording.start_time);
+    let now_ms = crate::state::now_epoch() * 1000;
+    order_transcribe_queue(&mut pending, now_ms);
     if pending.is_empty() {
         return 0;
     }
+    let backlog_mins: f64 = pending
+        .iter()
+        .map(|recording| recording.duration as f64 / 60_000.0)
+        .sum();
+    crate::login_log::info(&format!(
+        "auto-transcribe: {} pending ({:.1} min of audio), model={}",
+        pending.len(),
+        backlog_mins,
+        settings.transcription_model,
+    ));
 
     // Ensure the models are installed, downloading once if missing.
     let Ok(app_data) = app.path().app_data_dir() else {
@@ -560,8 +641,14 @@ pub(crate) async fn auto_transcribe_new(app: &AppHandle) -> usize {
     }
 
     let mut transcribed = 0usize;
-    for recording in pending {
-        match transcribe_recording_inner(app, &recording).await {
+    for (index, recording) in pending.iter().enumerate() {
+        crate::login_log::info(&format!(
+            "auto-transcribe: [{}/{}] {}",
+            index + 1,
+            pending.len(),
+            recording.filename
+        ));
+        match transcribe_recording_inner(app, recording).await {
             Ok(_) => transcribed += 1,
             // A user cancel stops the whole auto pass (don't march on to the next).
             Err(e) if e.to_lowercase().contains("cancel") => break,
@@ -582,14 +669,11 @@ pub fn open_local_transcript(
     let storage = state.storage.lock().map_err(|e| e.to_string())?;
     let settings = storage.get_settings();
     let root = std::path::PathBuf::from(&settings.download_dir);
-    let base = crate::sync::build_audio_path(&root, &recording, &settings);
-    let audio = [base.clone(), base.with_extension("opus")]
-        .into_iter()
-        .find(|path| path.is_file())
-        .ok_or_else(|| {
-            "Download this recording before opening its local transcript.".to_string()
-        })?;
-    let transcript = audio.with_extension("local.txt");
+    let base = crate::sync::resolve_local_base(&root, &recording, &settings);
+    crate::sync::local_audio(&base).ok_or_else(|| {
+        "Download this recording before opening its local transcript.".to_string()
+    })?;
+    let transcript = crate::sync::local_file(&base, ".local.txt");
     if !transcript.is_file() {
         return Err("This recording has no local transcript yet.".to_string());
     }
@@ -604,14 +688,11 @@ pub fn read_local_transcript(
     let storage = state.storage.lock().map_err(|e| e.to_string())?;
     let settings = storage.get_settings();
     let root = std::path::PathBuf::from(&settings.download_dir);
-    let base = crate::sync::build_audio_path(&root, &recording, &settings);
-    let audio = [base.clone(), base.with_extension("opus")]
-        .into_iter()
-        .find(|path| path.is_file())
-        .ok_or_else(|| {
-            "Download this recording before reading its local transcript.".to_string()
-        })?;
-    let transcript = audio.with_extension("local.txt");
+    let base = crate::sync::resolve_local_base(&root, &recording, &settings);
+    crate::sync::local_audio(&base).ok_or_else(|| {
+        "Download this recording before reading its local transcript.".to_string()
+    })?;
+    let transcript = crate::sync::local_file(&base, ".local.txt");
     std::fs::read_to_string(&transcript)
         .map_err(|e| format!("Could not read local transcript: {e}"))
 }
@@ -627,25 +708,71 @@ pub fn delete_local_recording(
     let storage = state.storage.lock().map_err(|e| e.to_string())?;
     let settings = storage.get_settings();
     let root = std::path::PathBuf::from(&settings.download_dir);
-    let base = crate::sync::build_audio_path(&root, &recording, &settings);
+    let base = crate::sync::resolve_local_base(&root, &recording, &settings);
+    let mut removed = 0usize;
     // Remove every file a download or local transcription may have produced.
-    for path in [
-        base.clone(),
-        base.with_extension("opus"),
-        base.with_extension("txt"),
-        base.with_extension("local.txt"),
-        base.with_extension("local.json"),
-    ] {
+    for path in crate::sync::local_file_variants(&base) {
         if path.is_file() {
             std::fs::remove_file(&path)
                 .map_err(|e| format!("Could not delete {}: {e}", path.display()))?;
+            removed += 1;
         }
     }
     // Remember it even if no files were present, so it stays out of the list.
     storage
         .add_deleted_id(&recording.id)
         .map_err(|e| e.to_string())?;
+    // Previously this returned Ok even when the derived path missed every file
+    // (easy to do: the path was derived from the cloud title, so a rename
+    // orphaned the files). The recording then vanished from the UI with all
+    // five files still on disk and no error anywhere.
+    if removed == 0 {
+        return Err(format!(
+            "No local files found for \"{}\". It may have been moved or deleted outside Plaud Sync.",
+            recording.filename
+        ));
+    }
     Ok(())
+}
+
+/// Recordings from this window jump the auto-transcribe queue ahead of older
+/// backlog, which still drains oldest-first so it cannot starve.
+const RECENT_TRANSCRIBE_WINDOW_MS: i64 = 48 * 60 * 60 * 1000;
+
+/// Order the auto-transcribe queue: newest-first inside the recent window, then
+/// the older backlog oldest-first.
+///
+/// Pure newest-first means a large backlog never drains. Pure oldest-first
+/// (v0.5.0) parks whatever was just recorded behind every older file, which is
+/// what the user hit when a fresh meeting sat behind 7 hours of audio. Grouping
+/// on recency keeps new recordings responsive while the backlog still drains.
+fn order_transcribe_queue(pending: &mut [PlaudRecording], now_ms: i64) {
+    pending.sort_by_key(|recording| {
+        let recent = recording.start_time >= now_ms - RECENT_TRANSCRIBE_WINDOW_MS;
+        // `!recent` sorts the recent group ahead of the backlog. Negating
+        // start_time inside that group makes a plain ascending sort yield
+        // newest-first there, while the backlog below keeps oldest-first.
+        (
+            !recent,
+            if recent {
+                -recording.start_time
+            } else {
+                recording.start_time
+            },
+        )
+    });
+}
+
+/// Compact elapsed-time label for the debug log ("4m 12s", "2h 05m").
+fn format_elapsed(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs >= 3600 {
+        format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    }
 }
 
 struct TranscriptionPermit<'a>(&'a std::sync::atomic::AtomicBool);
@@ -653,6 +780,27 @@ struct TranscriptionPermit<'a>(&'a std::sync::atomic::AtomicBool);
 impl Drop for TranscriptionPermit<'_> {
     fn drop(&mut self) {
         self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Holds `AppState::transcribing_id` for one run and clears it on drop, so
+/// an error or a cancel cannot leave a recording looking busy forever.
+struct TranscribingId<'a>(&'a std::sync::Mutex<Option<String>>);
+
+impl<'a> TranscribingId<'a> {
+    fn claim(slot: &'a std::sync::Mutex<Option<String>>, id: &str) -> Self {
+        if let Ok(mut current) = slot.lock() {
+            *current = Some(id.to_string());
+        }
+        Self(slot)
+    }
+}
+
+impl Drop for TranscribingId<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut current) = self.0.lock() {
+            *current = None;
+        }
     }
 }
 
@@ -676,12 +824,118 @@ pub async fn sync_now(
         return Err("Please choose a save folder in Settings first.".into());
     }
 
-    let result = sync_recordings(&app, &storage, &settings).await?;
+    let result = state
+        .run_sync_pass("manual sync", || sync_recordings(&app, &storage, &settings))
+        .await?;
     state.last_sync_epoch.store(
         crate::state::now_epoch(),
         std::sync::atomic::Ordering::Relaxed,
     );
     Ok(result)
+}
+
+/// Rename a recording in the Plaud cloud and mirror it locally.
+///
+/// Ordering is not negotiable: **cloud first**. If the local step fails after a
+/// successful write, the cloud is already correct, so we persist the new title
+/// and pin `local_basename` to the old name: the files keep that name but stay
+/// found by id, so nothing is downloaded twice. A local-first order would be
+/// reverted by the next sync (which reads the title from the cloud) and is
+/// indistinguishable from data loss.
+#[tauri::command]
+pub async fn rename_recording(
+    recording: PlaudRecording,
+    new_name: String,
+    state: State<'_, AppState>,
+) -> Result<PlaudRecording, String> {
+    let new_name = new_name.trim().to_string();
+    if new_name.is_empty() {
+        return Err("A new name cannot be empty.".to_string());
+    }
+    if state.transcribing_id().as_deref() == Some(recording.id.as_str()) {
+        return Err(
+            "This recording is being transcribed. Rename it when that finishes.".to_string(),
+        );
+    }
+
+    let storage = state.storage.lock().map_err(|e| e.to_string())?.clone();
+    // A sync pass resolves and downloads by the cached title and basename, so
+    // a rename landing in the middle of one makes it re-download under the
+    // old name. Share its single-flight guard.
+    state
+        .run_sync_pass("rename", || {
+            rename_recording_inner(storage, recording, new_name)
+        })
+        .await
+}
+
+async fn rename_recording_inner(
+    storage: crate::storage::Storage,
+    recording: PlaudRecording,
+    new_name: String,
+) -> Result<PlaudRecording, String> {
+    let settings = storage.get_settings();
+    let root = std::path::PathBuf::from(&settings.download_dir);
+
+    // The cache is the record of what the local files are named under. The
+    // caller's copy may already carry the new title (the UI updates the row
+    // optimistically), which would otherwise make this look like a no-op.
+    let mut current = recording.clone();
+    if let Some(cached) = storage.cached_recording(&recording.id) {
+        current.filename = cached.filename;
+        current.local_basename = cached.local_basename.or(current.local_basename);
+    }
+    if new_name == current.filename {
+        return Ok(current);
+    }
+
+    let mut client = PlaudClient::new(PlaudAuth::new(storage.clone()), storage.get_region());
+
+    // 1. Cloud. On failure, touch nothing on disk.
+    client
+        .rename_recording(&current.id, &new_name)
+        .await
+        .map_err(|e| format!("Could not rename in Plaud: {e}"))?;
+
+    // 2. Local mirror. Best-effort: the cloud write already succeeded.
+    let mut updated = current.clone();
+    updated.filename = new_name.clone();
+    let old_base = crate::sync::resolve_local_base(&root, &current, &settings);
+    let has_files = crate::sync::local_file_variants(&old_base)
+        .iter()
+        .any(|p| p.is_file());
+    if has_files {
+        match crate::sync::apply_local_rename(&root, &settings, &current, &new_name) {
+            Ok(basename) => updated.local_basename = Some(basename),
+            Err(e) => {
+                // Pin the files to this id under their old name, so they stay
+                // findable after the title changes. Never a duplicate download.
+                updated.local_basename = old_base
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string());
+                crate::login_log::warn(&format!(
+                    "renamed \"{}\" in the cloud but not on disk, keeping the old local name: {e}",
+                    current.filename
+                ));
+            }
+        }
+    }
+
+    // 3. Persist, so the next list shows the new title and the next sync does
+    //    not see a rename to mirror.
+    storage
+        .edit_recordings_cache(
+            |cached| match cached.iter_mut().find(|r| r.id == updated.id) {
+                Some(slot) => {
+                    slot.filename = updated.filename.clone();
+                    slot.local_basename = updated.local_basename.clone();
+                    ((), true)
+                }
+                None => ((), false),
+            },
+        )
+        .map_err(|e| format!("Renamed in Plaud, but could not save it locally: {e}"))?;
+    Ok(updated)
 }
 
 #[tauri::command]
@@ -697,7 +951,11 @@ pub async fn download_selected(
         return Err("Please choose a save folder in Settings first.".into());
     }
 
-    let result = crate::sync::download_selected(&app, &storage, &settings, &ids).await?;
+    let result = state
+        .run_sync_pass("selected download", || {
+            crate::sync::download_selected(&app, &storage, &settings, &ids)
+        })
+        .await?;
     state.last_sync_epoch.store(
         crate::state::now_epoch(),
         std::sync::atomic::Ordering::Relaxed,
@@ -837,12 +1095,9 @@ pub fn reveal_recording(
     let storage = state.storage.lock().map_err(|e| e.to_string())?;
     let settings = storage.get_settings();
     let root = std::path::PathBuf::from(&settings.download_dir);
-    let base = crate::sync::build_audio_path(&root, &recording, &settings);
+    let base = crate::sync::resolve_local_base(&root, &recording, &settings);
 
-    // `base` ends in .mp3; the actual file may be .opus.
-    let file = [base.clone(), base.with_extension("opus")]
-        .into_iter()
-        .find(|p| p.exists());
+    let file = crate::sync::local_audio(&base);
 
     match file {
         Some(path) => reveal_in_file_manager(&path),
@@ -876,5 +1131,90 @@ fn reveal_in_file_manager(path: &std::path::Path) -> Result<(), String> {
     {
         let dir = path.parent().unwrap_or(path);
         open::that(dir).map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plaud::types::PlaudRecording;
+
+    fn at(start_time: i64) -> PlaudRecording {
+        PlaudRecording {
+            id: format!("id-{start_time}"),
+            filename: format!("file-{start_time}"),
+            duration: 60_000,
+            start_time,
+            is_trans: false,
+            serial_number: "sn".into(),
+            downloaded: true,
+            local_transcript: false,
+            local_basename: None,
+        }
+    }
+
+    const HOUR_MS: i64 = 3_600_000;
+
+    #[test]
+    fn recent_recordings_go_first_newest_first() {
+        let now = 1_000 * HOUR_MS;
+        let mut pending = vec![
+            at(now - 2 * HOUR_MS),  // recent, older
+            at(now - 30 * 60_000),  // recent, newest
+            at(now - 20 * HOUR_MS), // backlog
+            at(now - 5 * HOUR_MS),  // recent, middle
+        ];
+        order_transcribe_queue(&mut pending, now);
+        let order: Vec<i64> = pending.iter().map(|r| r.start_time).collect();
+        assert_eq!(
+            order,
+            vec![
+                now - 30 * 60_000, // newest recent first
+                now - 2 * HOUR_MS,
+                now - 5 * HOUR_MS,
+                now - 20 * HOUR_MS, // backlog oldest-first, still drains
+            ]
+        );
+    }
+
+    #[test]
+    fn backlog_alone_drains_oldest_first_and_does_not_starve() {
+        let now = 1_000 * HOUR_MS;
+        // All older than the 48h window.
+        let mut pending = vec![
+            at(now - 72 * HOUR_MS),
+            at(now - 200 * HOUR_MS),
+            at(now - 100 * HOUR_MS),
+        ];
+        order_transcribe_queue(&mut pending, now);
+        let order: Vec<i64> = pending.iter().map(|r| r.start_time).collect();
+        assert_eq!(
+            order,
+            vec![now - 200 * HOUR_MS, now - 100 * HOUR_MS, now - 72 * HOUR_MS]
+        );
+    }
+
+    #[test]
+    fn everything_recent_orders_newest_first() {
+        let now = 1_000 * HOUR_MS;
+        let mut pending = vec![
+            at(now - 3 * HOUR_MS),
+            at(now - HOUR_MS),
+            at(now - 2 * HOUR_MS),
+        ];
+        order_transcribe_queue(&mut pending, now);
+        let order: Vec<i64> = pending.iter().map(|r| r.start_time).collect();
+        assert_eq!(
+            order,
+            vec![now - HOUR_MS, now - 2 * HOUR_MS, now - 3 * HOUR_MS]
+        );
+    }
+
+    #[test]
+    fn elapsed_formats_compactly() {
+        use std::time::Duration;
+        assert_eq!(format_elapsed(Duration::from_secs(9)), "9s");
+        assert_eq!(format_elapsed(Duration::from_secs(65)), "1m 05s");
+        assert_eq!(format_elapsed(Duration::from_secs(3720)), "1h 02m");
     }
 }

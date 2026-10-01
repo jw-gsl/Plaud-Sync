@@ -54,6 +54,11 @@
   let queueCancel = false;
   let localTranscribing = $state<string | null>(null);
   let localProgress = $state<LocalTranscriptionProgress | null>(null);
+  // Inline rename: id of the row being edited, its draft text, and a busy flag
+  // for the in-flight API write.
+  let renamingId = $state<string | null>(null);
+  let renameDraft = $state("");
+  let renameBusy = $state(false);
   // Local-model install state, so the row can offer to download the models when
   // they are missing instead of failing a transcription.
   let modelStatus = $state<LocalModelStatus | null>(null);
@@ -374,6 +379,69 @@
     if (recording.downloaded) void api.revealRecording(recording);
   }
 
+  // --- Rename -------------------------------------------------------------
+  // Renaming writes to the Plaud cloud first (see commands::rename_recording),
+  // so a failure here means nothing on disk was touched.
+  //
+  // Not offered while the recording is transcribing or queued: transcribe_file
+  // captures its audio path at the start and writes .local.txt / .local.json
+  // against that captured path at the end, so a rename in between strands the
+  // output under the old name.
+  function canRename(recording: Recording) {
+    if (renameBusy || renamingId) return false;
+    if (localTranscribing === recording.id) return false;
+    if (queue.some((q) => q.id === recording.id)) return false;
+    // Background auto-transcription reports progress without setting
+    // localTranscribing. The backend refuses this case too; this just avoids
+    // offering it.
+    if (localProgress?.recordingId === recording.id && localProgress.percent < 100) return false;
+    return true;
+  }
+
+  function startRename(recording: Recording) {
+    if (!canRename(recording)) return;
+    renamingId = recording.id;
+    renameDraft = recording.filename;
+    error = "";
+  }
+
+  function cancelRename() {
+    renamingId = null;
+    renameDraft = "";
+  }
+
+  async function commitRename(recording: Recording) {
+    // Enter commits and then removes the input, which can fire blur too.
+    if (renameBusy || renamingId !== recording.id) return;
+    const next = renameDraft.trim();
+    if (!next || next === recording.filename) {
+      cancelRename();
+      return;
+    }
+    renameBusy = true;
+    error = "";
+    const previous = recording.filename;
+    // Snapshot before the optimistic update: the backend must see the old
+    // title, or it reads the rename as a no-op.
+    const original = { ...recording };
+    // Optimistic: reflect the new name immediately, revert if the write fails.
+    recording.filename = next;
+    renamingId = null;
+    try {
+      const updated = await api.renameRecording(original, next);
+      Object.assign(recording, updated);
+      status = `Renamed "${previous}" to "${updated.filename}" in Plaud`;
+    } catch (e) {
+      recording.filename = previous;
+      error = String(e);
+    } finally {
+      renameBusy = false;
+      renameDraft = "";
+      // Re-derive downloaded/transcript flags in case the move changed them.
+      await refreshList();
+    }
+  }
+
   async function transcribe(recording: Recording) {
     if (!recording.downloaded || localTranscribing) return;
     localTranscribing = recording.id;
@@ -679,6 +747,11 @@
             tabindex="0"
             onclick={() => reveal(recording)}
             onkeydown={(event) => {
+              // Ignore key events that originated in a nested control (the
+              // transcribe checkbox): Space there should tick the box, not
+              // also reveal the row in Finder. Only the row itself is
+              // focusable, so target === currentTarget means the row has focus.
+              if (event.target !== event.currentTarget) return;
               if (event.key === "Enter" || event.key === " ") reveal(recording);
             }}
             title="Reveal in Finder"
@@ -687,14 +760,51 @@
               <input
                 type="checkbox"
                 checked={transcribeSelected.includes(recording.id)}
+                onclick={(event) => event.stopPropagation()}
                 onchange={() => toggleTranscribe(recording.id)}
               />
             {:else}
               <span class="dot done"></span>
             {/if}
-            <span class="rec-name">{recording.filename}</span>
+            {#if renamingId === recording.id}
+              <!-- svelte-ignore a11y_autofocus -->
+              <input
+                class="rename-input"
+                type="text"
+                bind:value={renameDraft}
+                autofocus
+                onclick={(event) => event.stopPropagation()}
+                onkeydown={(event) => {
+                  event.stopPropagation();
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    void commitRename(recording);
+                  } else if (event.key === "Escape") {
+                    event.preventDefault();
+                    cancelRename();
+                  }
+                }}
+                onblur={() => void commitRename(recording)}
+              />
+            {:else}
+              <!--
+                Double-click is a shortcut only; the keyboard-reachable control is
+                the "Rename" button below, so no ARIA role is needed here.
+              -->
+              <!-- svelte-ignore a11y_no_static_element_interactions -->
+              <span
+                class="rec-name"
+                title={recording.filename}
+                ondblclick={(event) => {
+                  event.stopPropagation();
+                  startRename(recording);
+                }}
+              >
+                {recording.filename}
+              </span>
+            {/if}
             <span class="rec-meta">
-              {formatDate(recording.startTime)} · {formatDuration(recording.duration)}{#if recording.isTrans} · TXT{/if}{#if recording.localTranscript} · Local TXT{/if}
+              {formatDate(recording.startTime)} · {formatDuration(recording.duration)}{#if recording.isTrans}{" · TXT"}{/if}{#if recording.localTranscript}{" · Local TXT"}{/if}
             </span>
             <span class="rec-state done">
               {#if localTranscribing === recording.id}
@@ -707,6 +817,24 @@
                 Saved
               {/if}
             </span>
+            {#if canRename(recording) || renamingId === recording.id}
+              <button
+                class="btn btn-ghost btn-sm transcribe-btn"
+                onmousedown={(event) => {
+                  // Keep focus in the input: its blur commits, so letting this
+                  // click blur it would save the draft instead of cancelling.
+                  if (renamingId === recording.id) event.preventDefault();
+                }}
+                onclick={(event) => {
+                  event.stopPropagation();
+                  if (renamingId === recording.id) cancelRename();
+                  else startRename(recording);
+                }}
+                title="Rename in Plaud, and on this computer"
+              >
+                {renamingId === recording.id ? "Cancel rename" : "Rename"}
+              </button>
+            {/if}
             {#if recording.localTranscript}
               <button
                 class="btn btn-ghost btn-sm transcribe-btn"
@@ -776,9 +904,9 @@
             {:else}
               <span class="dot new"></span>
             {/if}
-            <span class="rec-name">{recording.filename}</span>
+            <span class="rec-name" title={recording.filename}>{recording.filename}</span>
             <span class="rec-meta">
-              {formatDate(recording.startTime)} · {formatDuration(recording.duration)}{#if recording.isTrans} · TXT{/if}
+              {formatDate(recording.startTime)} · {formatDuration(recording.duration)}{#if recording.isTrans}{" · TXT"}{/if}
             </span>
             <span class="rec-state new">New</span>
           </div>
@@ -974,6 +1102,8 @@
   .rec-row {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
+    row-gap: 4px;
     gap: 12px;
     padding: 10px 8px;
     background: transparent;
@@ -1011,19 +1141,42 @@
     background: var(--primary);
   }
   .rec-name {
-    flex: 1;
-    min-width: 0;
+    /* Every other child of .rec-row is `flex: none`, so the name is the only
+       element that can absorb overflow. Without a floor it collapses to an
+       ellipsis on transcribed rows, which carry the longest meta text and
+       three buttons. Keep a readable minimum and let the meta yield first. */
+    flex: 1 1 18rem;
+    min-width: 12rem;
     font-size: 0.88rem;
     font-weight: 500;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  /* Same footprint as .rec-name so the row doesn't reflow while editing. */
+  .rename-input {
+    flex: 1 1 18rem;
+    min-width: 12rem;
+    padding: 0.15rem 0.35rem;
+    font-size: 0.88rem;
+    font-weight: 500;
+    color: var(--text);
+    background: var(--bg);
+    border: 1px solid var(--primary);
+    border-radius: 4px;
+  }
+  .rename-input:focus {
+    outline: none;
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 25%, transparent);
+  }
   .rec-meta {
     color: var(--text-muted);
     font-size: 0.76rem;
     white-space: nowrap;
-    flex: none;
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .rec-state {
     font-size: 0.68rem;

@@ -160,6 +160,32 @@ const WHISPER_FILES: &[ModelFile] = &[
     },
 ];
 
+// Whisper Large v3 Turbo. Same 32-layer encoder as large-v3 but only 4 decoder
+// layers instead of 32. Whisper decoding is autoregressive, so per-token cost
+// and KV-cache size both scale with decoder depth: this is ~8x less decode work
+// than large-v3 for near-identical English accuracy.
+// Checksums verified against the pinned commit on 2026-09-30.
+const WHISPER_TURBO_FILES: &[ModelFile] = &[
+    ModelFile {
+        name: "turbo-encoder.int8.onnx",
+        size: 674_716_297,
+        sha256: Some("b02dcdf54f348741e93fe732b67d933c8dcb6735655f710640143081db38878b"),
+        role: FileRole::Encoder,
+    },
+    ModelFile {
+        name: "turbo-decoder.int8.onnx",
+        size: 361_080_764,
+        sha256: Some("20accd02388482eb3a46bd615631adfdc85e1eb2c7db9ea3f02a40ffe6b81547"),
+        role: FileRole::Decoder,
+    },
+    ModelFile {
+        name: "turbo-tokens.txt",
+        size: 816_730,
+        sha256: Some("b34b360dbb493e781e479794586d661700670d65564001f23024971d1f2fa126"),
+        role: FileRole::Tokens,
+    },
+];
+
 /// Transcription models offered in Settings. The first entry is the default.
 pub const MODEL_SPECS: &[ModelSpec] = &[
     ModelSpec {
@@ -172,9 +198,18 @@ pub const MODEL_SPECS: &[ModelSpec] = &[
         files: PARAKEET_FILES,
     },
     ModelSpec {
+        id: "whisper-turbo-int8",
+        name: "Whisper Large v3 Turbo (INT8)",
+        description: "Whisper accuracy on accented and non-native English, far faster than Large v3: it has 4 decoder layers instead of 32, and both per-token decode cost and KV-cache size scale with decoder depth. A ~1.0 GB download. English transcription.",
+        engine: EngineKind::Whisper,
+        repo: "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-turbo",
+        revision: "2ca6ff69fc878651b770880507669577ac41c2ff",
+        files: WHISPER_TURBO_FILES,
+    },
+    ModelSpec {
         id: "whisper-large-v3-int8",
         name: "Whisper Large v3 (INT8)",
-        description: "Best accuracy for accented and non-native English. Slower on CPU and a ~1.8 GB download. English transcription.",
+        description: "Best accuracy for accented and non-native English, but very slow on CPU: measured at ~4x slower than real time on an M5 Pro, so a 1-hour recording takes about 4 hours. Prefer Turbo unless you need this exact model. A ~1.8 GB download. English transcription.",
         engine: EngineKind::Whisper,
         repo: "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-large-v3",
         revision: "2a6507094dd6020d939d78e3f1834a1d06267fca",

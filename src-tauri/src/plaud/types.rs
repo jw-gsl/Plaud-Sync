@@ -113,6 +113,18 @@ pub struct PlaudRecording {
     pub downloaded: bool,
     #[serde(default)]
     pub local_transcript: bool,
+    /// Basename (no extension) of this recording's files on disk, relative to
+    /// its folder. Written when the audio is downloaded and backfilled for
+    /// existing libraries.
+    ///
+    /// Local files were historically resolved by deriving a path from the
+    /// *cloud title*, so renaming a recording in the Plaud web UI changed the
+    /// derived path: the app re-downloaded the same audio as a duplicate,
+    /// lost the transcript flag, and (on delete) silently removed nothing.
+    /// Keying on the stable recording id instead fixes all three.
+    /// `None` for recordings never downloaded, or predating this field.
+    #[serde(default)]
+    pub local_basename: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

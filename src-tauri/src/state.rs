@@ -40,6 +40,42 @@ pub enum BrowserLogin {
     },
 }
 
+impl AppState {
+    /// The recording currently being transcribed, if any.
+    pub fn transcribing_id(&self) -> Option<String> {
+        self.transcribing_id
+            .lock()
+            .map(|id| id.clone())
+            .unwrap_or_default()
+    }
+
+    /// Run `body` only if no sync pass is in flight.
+    ///
+    /// Returns `Err` with a user-facing message when a pass is already running,
+    /// so a manual click gets honest feedback instead of silently racing the
+    /// auto-sync loop.
+    pub async fn run_sync_pass<T, F, Fut>(&self, what: &str, body: F) -> Result<T, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<T, String>>,
+    {
+        if self
+            .sync_running
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Err(format!("A sync is already running — {what} skipped it."));
+        }
+        struct Guard<'a>(&'a AtomicBool);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let _guard = Guard(&self.sync_running);
+        body().await
+    }
+}
+
 pub struct AppState {
     pub storage: Mutex<Storage>,
     pub browser_login_tx: Mutex<Option<oneshot::Sender<Result<BrowserLogin, String>>>>,
@@ -47,6 +83,12 @@ pub struct AppState {
     /// so the "next auto-sync" countdown is valid from startup. Shared with the
     /// auto-sync loop so the countdown matches the real schedule.
     pub last_sync_epoch: AtomicI64,
+    /// Single-flight guard for a sync/download pass. The auto-sync loop and a
+    /// manual "Sync now" can otherwise overlap: both list the same recordings,
+    /// both see the file as not-yet-on-disk, and both download it seconds
+    /// apart. The loser used to double-download (and could double-enqueue for
+    /// transcription, which is expensive).
+    pub sync_running: AtomicBool,
     /// Prevents concurrent local ASR jobs from competing for the model's
     /// memory and CPU. The first MVP intentionally runs one job at a time.
     pub local_transcription_running: AtomicBool,
@@ -54,6 +96,74 @@ pub struct AppState {
     /// blocking transcription worker. `Arc` so it can be cloned into the
     /// `spawn_blocking` closure, which requires a `'static` handle.
     pub local_transcription_cancelled: Arc<AtomicBool>,
+    /// Id of the recording being transcribed right now. Its local files must
+    /// not be renamed until the run finishes: the run writes its output
+    /// against the audio path it captured at the start.
+    pub transcribing_id: Mutex<Option<String>>,
     pub local_model_download_running: AtomicBool,
     pub local_model_download_cancelled: AtomicBool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// The guard exists because overlapping passes double-download. Prove the
+    /// second one is refused rather than merely slowed down.
+    #[tokio::test]
+    async fn second_sync_pass_is_refused_while_first_is_in_flight() {
+        let state = AppState {
+            storage: Mutex::new(
+                crate::storage::Storage::new(std::env::temp_dir().join("plaud-sync-state-test"))
+                    .expect("storage"),
+            ),
+            browser_login_tx: Mutex::new(None),
+            last_sync_epoch: AtomicI64::new(0),
+            sync_running: AtomicBool::new(false),
+            local_transcription_running: AtomicBool::new(false),
+            local_transcription_cancelled: Arc::new(AtomicBool::new(false)),
+            transcribing_id: Mutex::new(None),
+            local_model_download_running: AtomicBool::new(false),
+            local_model_download_cancelled: AtomicBool::new(false),
+        };
+
+        let concurrent = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        // Two passes launched together: the second must be refused outright.
+        let body = || {
+            let concurrent = concurrent.clone();
+            let peak = peak.clone();
+            async move {
+                let now = concurrent.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                concurrent.fetch_sub(1, Ordering::SeqCst);
+                Ok(42u32)
+            }
+        };
+        let (a, b) = tokio::join!(
+            state.run_sync_pass("first", body),
+            state.run_sync_pass("second", body)
+        );
+
+        let outcomes = [a, b];
+        assert_eq!(outcomes.iter().filter(|r| r.is_ok()).count(), 1);
+        assert_eq!(outcomes.iter().filter(|r| r.is_err()).count(), 1);
+        assert_eq!(peak.load(Ordering::SeqCst), 1, "passes overlapped");
+        let refused = outcomes
+            .iter()
+            .find_map(|r| r.as_ref().err())
+            .expect("one pass refused");
+        assert!(refused.contains("already running"), "{refused}");
+
+        // Guard released: a later pass runs normally.
+        assert!(state
+            .run_sync_pass("third", || async { Ok(7u32) })
+            .await
+            .is_ok());
+    }
 }

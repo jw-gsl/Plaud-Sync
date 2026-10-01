@@ -266,10 +266,19 @@ pub fn transcribe_file(
         None => None,
     };
     let used_diarization = diarization_segments.is_some();
+    // Count *distinct* speaker labels, not the highest label seen. The
+    // clustering stage emits sparse, non-contiguous ids, so `max + 1` badly
+    // overstates the result -- observed as 863 "speakers" on a recording that
+    // only carried 132 distinct labels (and ~8 real participants).
     let speaker_count = diarization_segments
         .as_ref()
-        .and_then(|segments| segments.iter().map(|segment| segment.speaker).max())
-        .map(|speaker| speaker + 1)
+        .map(|segments| {
+            segments
+                .iter()
+                .map(|segment| segment.speaker)
+                .collect::<std::collections::HashSet<_>>()
+                .len() as u32
+        })
         .unwrap_or(0);
     let speaker_segments = asr_segments
         .iter()
@@ -716,9 +725,15 @@ fn create_diarizer(paths: &model_store::PipelineModelPaths) -> Option<OfflineSpe
     config.embedding.model = Some(paths.embedding.to_string_lossy().to_string());
     config.embedding.num_threads = recommended_threads().min(8);
     config.embedding.provider = Some("cpu".to_string());
+    // Distance cut-off: higher merges more, giving fewer speakers. 0.55
+    // labelled a 2-person consult as 28 speakers. Swept with
+    // diar_threshold_sweep on known counts (2, 2, ~4, 1), distinct labels:
+    //   0.55: 28/11/17/1   1.10: 7/4/4/1   1.20: 3/2/2/1   1.25: 2/1/1/1
+    // Past ~1.15 real speakers start merging, and that is the worse error
+    // (two people under one label), so stay below the cliff.
     config.clustering = FastClusteringConfig {
         num_clusters: -1,
-        threshold: 0.55,
+        threshold: 1.10,
     };
     OfflineSpeakerDiarization::create(&config)
 }
@@ -997,6 +1012,84 @@ mod tests {
                     "threads={threads} audio={minutes}min wall={wall:.1}s xrtf={:.3} speakers={}",
                     wall / audio_secs,
                     result.map(|r| r.num_speakers()).unwrap_or(-1)
+                );
+            }
+        }
+    }
+
+    /// Manual threshold sweep (ignored by default). The clustering threshold
+    /// is a distance cut-off: a HIGHER value merges more and gives FEWER
+    /// speakers. This finds the value that recovers known speaker counts.
+    /// PLAUD_DIAR_BENCH_AUDIO=/a.mp3,/b.mp3 (comma-separated) \
+    /// PLAUD_DIAR_BENCH_MODELS=/path/to/speech-segmentation-diarization-v1 \
+    /// [PLAUD_DIAR_BENCH_MAX_SECS=300] [PLAUD_DIAR_BENCH_THRESHOLDS=0.55,0.95] \
+    /// cargo test diar_threshold_sweep -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn diar_threshold_sweep() {
+        let audios: Vec<String> = std::env::var("PLAUD_DIAR_BENCH_AUDIO")
+            .unwrap()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let models = std::env::var("PLAUD_DIAR_BENCH_MODELS").unwrap();
+        let max_secs: usize = std::env::var("PLAUD_DIAR_BENCH_MAX_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300);
+        let paths = model_store::PipelineModelPaths {
+            vad: Path::new(&models).join("silero_vad.int8.onnx"),
+            segmentation: Path::new(&models).join("segmentation.int8.onnx"),
+            embedding: Path::new(&models).join("embedding.onnx"),
+        };
+        let thresholds: Vec<f32> = std::env::var("PLAUD_DIAR_BENCH_THRESHOLDS")
+            .unwrap_or_else(|_| "0.55,0.75,0.95,1.05,1.15,1.25".to_string())
+            .split(',')
+            .filter_map(|t| t.trim().parse().ok())
+            .collect();
+        for audio in &audios {
+            let all = audio::decode_to_16khz_mono(Path::new(audio)).unwrap();
+            let n = (max_secs * SAMPLE_RATE as usize).min(all.len());
+            let slice = &all[..n];
+            println!(
+                "== {} ({}s of {}s)",
+                Path::new(audio).file_name().unwrap().to_string_lossy(),
+                n / SAMPLE_RATE as usize,
+                all.len() / SAMPLE_RATE as usize
+            );
+            for &threshold in &thresholds {
+                let mut config = OfflineSpeakerDiarizationConfig::default();
+                config.segmentation = OfflineSpeakerSegmentationModelConfig {
+                    pyannote: OfflineSpeakerSegmentationPyannoteModelConfig {
+                        model: Some(paths.segmentation.to_string_lossy().to_string()),
+                    },
+                    num_threads: 8,
+                    debug: false,
+                    provider: Some("cpu".to_string()),
+                };
+                config.embedding.model = Some(paths.embedding.to_string_lossy().to_string());
+                config.embedding.num_threads = 8;
+                config.embedding.provider = Some("cpu".to_string());
+                config.clustering = FastClusteringConfig {
+                    num_clusters: -1,
+                    threshold,
+                };
+                let diarizer = OfflineSpeakerDiarization::create(&config).unwrap();
+                let result = diarizer.process(slice).unwrap();
+                let sorted: Vec<i32> = result
+                    .sort_by_start_time()
+                    .into_iter()
+                    .map(|s| s.speaker)
+                    .collect();
+                let mut speakers = sorted.clone();
+                speakers.sort_unstable();
+                speakers.dedup();
+                println!(
+                    "  threshold={threshold:.2} speakers={} segments={} distinct={}",
+                    result.num_speakers(),
+                    sorted.len(),
+                    speakers.len()
                 );
             }
         }
