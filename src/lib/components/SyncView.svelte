@@ -54,6 +54,11 @@
   let queueCancel = false;
   let localTranscribing = $state<string | null>(null);
   let localProgress = $state<LocalTranscriptionProgress | null>(null);
+  // Inline rename: id of the row being edited, its draft text, and a busy flag
+  // for the in-flight API write.
+  let renamingId = $state<string | null>(null);
+  let renameDraft = $state("");
+  let renameBusy = $state(false);
   // Local-model install state, so the row can offer to download the models when
   // they are missing instead of failing a transcription.
   let modelStatus = $state<LocalModelStatus | null>(null);
@@ -372,6 +377,60 @@
 
   function reveal(recording: Recording) {
     if (recording.downloaded) void api.revealRecording(recording);
+  }
+
+  // --- Rename -------------------------------------------------------------
+  // Renaming writes to the Plaud cloud first (see commands::rename_recording),
+  // so a failure here means nothing on disk was touched.
+  //
+  // Not offered while the recording is transcribing or queued: transcribe_file
+  // captures its audio path at the start and writes .local.txt / .local.json
+  // against that captured path at the end, so a rename in between strands the
+  // output under the old name.
+  function canRename(recording: Recording) {
+    if (renameBusy || renamingId) return false;
+    if (localTranscribing === recording.id) return false;
+    if (queue.some((q) => q.id === recording.id)) return false;
+    return true;
+  }
+
+  function startRename(recording: Recording) {
+    if (!canRename(recording)) return;
+    renamingId = recording.id;
+    renameDraft = recording.filename;
+    error = "";
+  }
+
+  function cancelRename() {
+    renamingId = null;
+    renameDraft = "";
+  }
+
+  async function commitRename(recording: Recording) {
+    const next = renameDraft.trim();
+    if (!next || next === recording.filename) {
+      cancelRename();
+      return;
+    }
+    renameBusy = true;
+    error = "";
+    const previous = recording.filename;
+    // Optimistic: reflect the new name immediately, revert if the write fails.
+    recording.filename = next;
+    renamingId = null;
+    try {
+      const updated = await api.renameRecording(recording, next);
+      Object.assign(recording, updated);
+      status = `Renamed "${previous}" to "${updated.filename}" in Plaud`;
+    } catch (e) {
+      recording.filename = previous;
+      error = String(e);
+    } finally {
+      renameBusy = false;
+      renameDraft = "";
+      // Re-derive downloaded/transcript flags in case the move changed them.
+      await refreshList();
+    }
   }
 
   async function transcribe(recording: Recording) {
@@ -698,7 +757,43 @@
             {:else}
               <span class="dot done"></span>
             {/if}
-            <span class="rec-name" title={recording.filename}>{recording.filename}</span>
+            {#if renamingId === recording.id}
+              <!-- svelte-ignore a11y_autofocus -->
+              <input
+                class="rename-input"
+                type="text"
+                bind:value={renameDraft}
+                autofocus
+                onclick={(event) => event.stopPropagation()}
+                onkeydown={(event) => {
+                  event.stopPropagation();
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    void commitRename(recording);
+                  } else if (event.key === "Escape") {
+                    event.preventDefault();
+                    cancelRename();
+                  }
+                }}
+                onblur={() => void commitRename(recording)}
+              />
+            {:else}
+              <!--
+                Double-click is a shortcut only; the keyboard-reachable control is
+                the "Rename" button below, so no ARIA role is needed here.
+              -->
+              <!-- svelte-ignore a11y_no_static_element_interactions -->
+              <span
+                class="rec-name"
+                title={recording.filename}
+                ondblclick={(event) => {
+                  event.stopPropagation();
+                  startRename(recording);
+                }}
+              >
+                {recording.filename}
+              </span>
+            {/if}
             <span class="rec-meta">
               {formatDate(recording.startTime)} · {formatDuration(recording.duration)}{#if recording.isTrans}{" · TXT"}{/if}{#if recording.localTranscript}{" · Local TXT"}{/if}
             </span>
@@ -713,6 +808,19 @@
                 Saved
               {/if}
             </span>
+            {#if canRename(recording) || renamingId === recording.id}
+              <button
+                class="btn btn-ghost btn-sm transcribe-btn"
+                onclick={(event) => {
+                  event.stopPropagation();
+                  if (renamingId === recording.id) cancelRename();
+                  else startRename(recording);
+                }}
+                title="Rename in Plaud, and on this computer"
+              >
+                {renamingId === recording.id ? "Cancel rename" : "Rename"}
+              </button>
+            {/if}
             {#if recording.localTranscript}
               <button
                 class="btn btn-ghost btn-sm transcribe-btn"
@@ -1030,6 +1138,22 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  /* Same footprint as .rec-name so the row doesn't reflow while editing. */
+  .rename-input {
+    flex: 1 1 18rem;
+    min-width: 12rem;
+    padding: 0.15rem 0.35rem;
+    font-size: 0.88rem;
+    font-weight: 500;
+    color: var(--text);
+    background: var(--bg);
+    border: 1px solid var(--primary);
+    border-radius: 4px;
+  }
+  .rename-input:focus {
+    outline: none;
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 25%, transparent);
   }
   .rec-meta {
     color: var(--text-muted);
