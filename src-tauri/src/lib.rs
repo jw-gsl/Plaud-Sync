@@ -47,6 +47,7 @@ pub fn run() {
                 local_transcription_cancelled: std::sync::Arc::new(
                     std::sync::atomic::AtomicBool::new(false),
                 ),
+                transcribing_id: std::sync::Mutex::new(None),
                 local_model_download_running: std::sync::atomic::AtomicBool::new(false),
                 local_model_download_cancelled: std::sync::atomic::AtomicBool::new(false),
             });

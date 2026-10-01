@@ -391,6 +391,10 @@
     if (renameBusy || renamingId) return false;
     if (localTranscribing === recording.id) return false;
     if (queue.some((q) => q.id === recording.id)) return false;
+    // Background auto-transcription reports progress without setting
+    // localTranscribing. The backend refuses this case too; this just avoids
+    // offering it.
+    if (localProgress?.recordingId === recording.id && localProgress.percent < 100) return false;
     return true;
   }
 
@@ -407,6 +411,8 @@
   }
 
   async function commitRename(recording: Recording) {
+    // Enter commits and then removes the input, which can fire blur too.
+    if (renameBusy || renamingId !== recording.id) return;
     const next = renameDraft.trim();
     if (!next || next === recording.filename) {
       cancelRename();
@@ -415,11 +421,14 @@
     renameBusy = true;
     error = "";
     const previous = recording.filename;
+    // Snapshot before the optimistic update: the backend must see the old
+    // title, or it reads the rename as a no-op.
+    const original = { ...recording };
     // Optimistic: reflect the new name immediately, revert if the write fails.
     recording.filename = next;
     renamingId = null;
     try {
-      const updated = await api.renameRecording(recording, next);
+      const updated = await api.renameRecording(original, next);
       Object.assign(recording, updated);
       status = `Renamed "${previous}" to "${updated.filename}" in Plaud`;
     } catch (e) {
@@ -811,6 +820,11 @@
             {#if canRename(recording) || renamingId === recording.id}
               <button
                 class="btn btn-ghost btn-sm transcribe-btn"
+                onmousedown={(event) => {
+                  // Keep focus in the input: its blur commits, so letting this
+                  // click blur it would save the draft instead of cancelling.
+                  if (renamingId === recording.id) event.preventDefault();
+                }}
                 onclick={(event) => {
                   event.stopPropagation();
                   if (renamingId === recording.id) cancelRename();

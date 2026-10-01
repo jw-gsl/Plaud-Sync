@@ -140,8 +140,12 @@ pub async fn list_recordings(state: State<'_, AppState>) -> Result<Vec<PlaudReco
 
     let mut recordings = client.list_recordings().await?;
     // The API listing carries no local state; re-attach the id-keyed on-disk
-    // basename saved at download time.
-    storage.restore_local_basenames(&mut recordings);
+    // basename and mirror any web/phone rename before deriving any flags.
+    // This must run here and not only in the sync pass: this listing is saved
+    // over the cache below, so a rename it saw would otherwise never be seen
+    // again.
+    let busy = state.transcribing_id();
+    crate::sync::reconcile_listing(&storage, &settings, &mut recordings, busy.as_deref());
     mark_downloaded_status(&mut recordings, &settings);
     mark_local_transcript_status(&mut recordings, &settings);
     // Hide locally-deleted recordings so they don't reappear after a resync.
@@ -377,6 +381,7 @@ pub(crate) async fn transcribe_recording_inner(
         );
     }
     let _permit = TranscriptionPermit(&state.local_transcription_running);
+    let _busy = TranscribingId::claim(&state.transcribing_id, &recording.id);
     // Clear any cancellation left over from a previous run before we start.
     state
         .local_transcription_cancelled
@@ -402,6 +407,17 @@ pub(crate) async fn transcribe_recording_inner(
         ));
     }
 
+    // The caller's copy can predate a rename (the UI row, or an auto pass's
+    // queue built before an earlier item finished), so resolve by the cache's
+    // basename for this id.
+    let mut recording = recording.clone();
+    if let Some(basename) = storage
+        .cached_recording(&recording.id)
+        .and_then(|cached| cached.local_basename)
+    {
+        recording.local_basename = Some(basename);
+    }
+    let recording = &recording;
     let root = std::path::PathBuf::from(&settings.download_dir);
     let base = crate::sync::resolve_local_base(&root, recording, &settings);
     let audio_path = crate::sync::local_audio(&base)
@@ -544,10 +560,11 @@ pub(crate) async fn auto_transcribe_new(app: &AppHandle) -> usize {
     let Ok(mut recordings) = client.list_recordings().await else {
         return 0;
     };
-    // Re-attach the id-keyed local basenames: a fresh listing has no local
-    // state, and without this a renamed recording's files look absent here and
-    // are never picked up for transcription.
-    storage.restore_local_basenames(&mut recordings);
+    // Re-attach the id-keyed local basenames (and mirror renames): a fresh
+    // listing has no local state, and without this a renamed recording's files
+    // look absent here and are never picked up for transcription.
+    let busy = state.transcribing_id();
+    crate::sync::reconcile_listing(&storage, &settings, &mut recordings, busy.as_deref());
     let deleted = storage.get_deleted_ids();
     let root = std::path::PathBuf::from(&settings.download_dir);
     let mut pending: Vec<PlaudRecording> = recordings
@@ -557,11 +574,8 @@ pub(crate) async fn auto_transcribe_new(app: &AppHandle) -> usize {
                 return false;
             }
             let base = crate::sync::resolve_local_base(&root, r, &settings);
-            // Use the shared suffix list so "x.local.txt" is not mistaken for
-            // the plain ".txt" Plaud transcript.
-            let downloaded = crate::sync::local_file_variants(&base)
-                .into_iter()
-                .any(|p| p.is_file());
+            // Audio specifically: a lone Plaud .txt is not something to transcribe.
+            let downloaded = crate::sync::local_audio(&base).is_some();
             let transcribed = crate::sync::local_file(&base, ".local.txt").exists();
             downloaded && !transcribed
         })
@@ -769,6 +783,27 @@ impl Drop for TranscriptionPermit<'_> {
     }
 }
 
+/// Holds `AppState::transcribing_id` for one run and clears it on drop, so
+/// an error or a cancel cannot leave a recording looking busy forever.
+struct TranscribingId<'a>(&'a std::sync::Mutex<Option<String>>);
+
+impl<'a> TranscribingId<'a> {
+    fn claim(slot: &'a std::sync::Mutex<Option<String>>, id: &str) -> Self {
+        if let Ok(mut current) = slot.lock() {
+            *current = Some(id.to_string());
+        }
+        Self(slot)
+    }
+}
+
+impl Drop for TranscribingId<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut current) = self.0.lock() {
+            *current = None;
+        }
+    }
+}
+
 struct ModelDownloadPermit<'a>(&'a std::sync::atomic::AtomicBool);
 
 impl Drop for ModelDownloadPermit<'_> {
@@ -802,53 +837,104 @@ pub async fn sync_now(
 /// Rename a recording in the Plaud cloud and mirror it locally.
 ///
 /// Ordering is not negotiable: **cloud first**. If the local step fails after a
-/// successful write, the cloud is already correct, so we persist the new title,
-/// leave `local_basename` pointing at the old name and let the sync mirror
-/// repair it next pass. A local-first order would be reverted by the next sync
-/// (which reads the title from the cloud) and is indistinguishable from data
-/// loss.
+/// successful write, the cloud is already correct, so we persist the new title
+/// and pin `local_basename` to the old name: the files keep that name but stay
+/// found by id, so nothing is downloaded twice. A local-first order would be
+/// reverted by the next sync (which reads the title from the cloud) and is
+/// indistinguishable from data loss.
 #[tauri::command]
 pub async fn rename_recording(
     recording: PlaudRecording,
     new_name: String,
     state: State<'_, AppState>,
 ) -> Result<PlaudRecording, String> {
-    let new_name = new_name.trim();
+    let new_name = new_name.trim().to_string();
     if new_name.is_empty() {
         return Err("A new name cannot be empty.".to_string());
     }
-    if new_name == recording.filename {
-        return Ok(recording);
+    if state.transcribing_id().as_deref() == Some(recording.id.as_str()) {
+        return Err(
+            "This recording is being transcribed. Rename it when that finishes.".to_string(),
+        );
     }
 
     let storage = state.storage.lock().map_err(|e| e.to_string())?.clone();
+    // A sync pass resolves and downloads by the cached title and basename, so
+    // a rename landing in the middle of one makes it re-download under the
+    // old name. Share its single-flight guard.
+    state
+        .run_sync_pass("rename", || {
+            rename_recording_inner(storage, recording, new_name)
+        })
+        .await
+}
+
+async fn rename_recording_inner(
+    storage: crate::storage::Storage,
+    recording: PlaudRecording,
+    new_name: String,
+) -> Result<PlaudRecording, String> {
     let settings = storage.get_settings();
+    let root = std::path::PathBuf::from(&settings.download_dir);
+
+    // The cache is the record of what the local files are named under. The
+    // caller's copy may already carry the new title (the UI updates the row
+    // optimistically), which would otherwise make this look like a no-op.
+    let mut current = recording.clone();
+    if let Some(cached) = storage.cached_recording(&recording.id) {
+        current.filename = cached.filename;
+        current.local_basename = cached.local_basename.or(current.local_basename);
+    }
+    if new_name == current.filename {
+        return Ok(current);
+    }
+
     let mut client = PlaudClient::new(PlaudAuth::new(storage.clone()), storage.get_region());
 
     // 1. Cloud. On failure, touch nothing on disk.
     client
-        .rename_recording(&recording.id, new_name)
+        .rename_recording(&current.id, &new_name)
         .await
         .map_err(|e| format!("Could not rename in Plaud: {e}"))?;
 
     // 2. Local mirror. Best-effort: the cloud write already succeeded.
-    let root = std::path::PathBuf::from(&settings.download_dir);
-    let mut updated = recording.clone();
-    updated.filename = new_name.to_string();
-    match crate::sync::apply_local_rename(&root, &settings, &recording, new_name) {
-        Ok(basename) => {
-            updated.local_basename = Some(basename);
-        }
-        Err(e) => {
-            crate::login_log::warn(&format!(
-                "renamed \"{}\" in the cloud but not on disk: {e}",
-                recording.filename
-            ));
+    let mut updated = current.clone();
+    updated.filename = new_name.clone();
+    let old_base = crate::sync::resolve_local_base(&root, &current, &settings);
+    let has_files = crate::sync::local_file_variants(&old_base)
+        .iter()
+        .any(|p| p.is_file());
+    if has_files {
+        match crate::sync::apply_local_rename(&root, &settings, &current, &new_name) {
+            Ok(basename) => updated.local_basename = Some(basename),
+            Err(e) => {
+                // Pin the files to this id under their old name, so they stay
+                // findable after the title changes. Never a duplicate download.
+                updated.local_basename = old_base
+                    .file_name()
+                    .map(|name| name.to_string_lossy().to_string());
+                crate::login_log::warn(&format!(
+                    "renamed \"{}\" in the cloud but not on disk, keeping the old local name: {e}",
+                    current.filename
+                ));
+            }
         }
     }
 
-    // 3. Persist, so the next list shows the new title without a refetch.
-    storage.update_cached_recording(&updated);
+    // 3. Persist, so the next list shows the new title and the next sync does
+    //    not see a rename to mirror.
+    storage
+        .edit_recordings_cache(
+            |cached| match cached.iter_mut().find(|r| r.id == updated.id) {
+                Some(slot) => {
+                    slot.filename = updated.filename.clone();
+                    slot.local_basename = updated.local_basename.clone();
+                    ((), true)
+                }
+                None => ((), false),
+            },
+        )
+        .map_err(|e| format!("Renamed in Plaud, but could not save it locally: {e}"))?;
     Ok(updated)
 }
 

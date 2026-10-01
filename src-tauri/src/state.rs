@@ -41,6 +41,14 @@ pub enum BrowserLogin {
 }
 
 impl AppState {
+    /// The recording currently being transcribed, if any.
+    pub fn transcribing_id(&self) -> Option<String> {
+        self.transcribing_id
+            .lock()
+            .map(|id| id.clone())
+            .unwrap_or_default()
+    }
+
     /// Run `body` only if no sync pass is in flight.
     ///
     /// Returns `Err` with a user-facing message when a pass is already running,
@@ -88,6 +96,10 @@ pub struct AppState {
     /// blocking transcription worker. `Arc` so it can be cloned into the
     /// `spawn_blocking` closure, which requires a `'static` handle.
     pub local_transcription_cancelled: Arc<AtomicBool>,
+    /// Id of the recording being transcribed right now. Its local files must
+    /// not be renamed until the run finishes: the run writes its output
+    /// against the audio path it captured at the start.
+    pub transcribing_id: Mutex<Option<String>>,
     pub local_model_download_running: AtomicBool,
     pub local_model_download_cancelled: AtomicBool,
 }
@@ -113,6 +125,7 @@ mod tests {
             sync_running: AtomicBool::new(false),
             local_transcription_running: AtomicBool::new(false),
             local_transcription_cancelled: Arc::new(AtomicBool::new(false)),
+            transcribing_id: Mutex::new(None),
             local_model_download_running: AtomicBool::new(false),
             local_model_download_cancelled: AtomicBool::new(false),
         };

@@ -79,11 +79,11 @@ async fn download_list(
     recordings: &mut [PlaudRecording],
     settings: &AppSettings,
 ) -> Result<SyncResult, String> {
-    // A fresh API listing knows nothing about local names, so re-attach the
-    // id-keyed basenames before anything resolves a path. Without this, an
-    // already-downloaded recording looks absent until something calls
-    // list_recordings, and auto-transcription misses renamed files.
-    storage.restore_local_basenames(recordings);
+    // A fresh API listing knows nothing about local names: re-attach the
+    // id-keyed basenames, and mirror any rename made in the web or phone app,
+    // before anything resolves a path.
+    let busy = app.state::<AppState>().transcribing_id();
+    let renamed = reconcile_listing(storage, settings, recordings, busy.as_deref());
     let total = recordings.len();
     let download_root = PathBuf::from(&settings.download_dir);
     fs::create_dir_all(&download_root).map_err(|e| e.to_string())?;
@@ -91,7 +91,6 @@ async fn download_list(
     let mut downloaded = 0usize;
     let mut skipped = 0usize;
     let mut failed = 0usize;
-    let mut renamed = 0usize;
 
     for (index, recording) in recordings.iter().enumerate() {
         let _ = app.emit(
@@ -103,47 +102,6 @@ async fn download_list(
                 filename: recording.filename.clone(),
             },
         );
-
-        // A rename made in the Plaud web or phone app shows up here as a
-        // changed title for a known id. Mirror it locally through the same code
-        // path the in-app rename uses. Comparing the cached title to the listed
-        // title is enough; no version comparison needed.
-        if let Some(cached_title) = storage.cached_filename(&recording.id) {
-            if cached_title != recording.filename {
-                let mut cached = recording.clone();
-                cached.filename = cached_title.clone();
-                match apply_local_rename(&download_root, settings, &cached, &recording.filename) {
-                    Ok(basename) => {
-                        crate::login_log::info(&format!(
-                            "mirrored cloud rename \"{}\" -> \"{}\" on disk as {basename}",
-                            cached_title, recording.filename
-                        ));
-                        if let Err(e) = storage.set_local_basename(&recording.id, &basename) {
-                            crate::login_log::warn(&format!(
-                                "could not record local basename for \"{}\" (id {}): {e}",
-                                recording.filename, recording.id
-                            ));
-                        }
-                        // Also store the new title, otherwise the next sync sees
-                        // the same difference again and re-runs a rename whose
-                        // source name no longer exists.
-                        if let Err(e) =
-                            storage.update_cached_filename(&recording.id, &recording.filename)
-                        {
-                            crate::login_log::warn(&format!(
-                                "could not record renamed title for \"{}\" (id {}): {e}",
-                                recording.filename, recording.id
-                            ));
-                        }
-                        renamed += 1;
-                    }
-                    Err(e) => crate::login_log::warn(&format!(
-                        "cloud rename \"{}\" -> \"{}\" (id {}) not mirrored: {e}",
-                        cached_title, recording.filename, recording.id
-                    )),
-                }
-            }
-        }
 
         // Resolve by recording id (local_basename) where known, so a cloud-side
         // rename cannot make an already-downloaded file look absent.
@@ -474,6 +432,93 @@ pub fn resolve_local_base(
     }
 }
 
+/// Bring a fresh API listing up to date with what is on disk, and mirror any
+/// title change made in the Plaud web or phone app onto the local files.
+///
+/// Every path that takes a fresh listing calls this before resolving a local
+/// path: the listing carries no local state, and the cache's title is the only
+/// record of what the files were named under. Runs under the cache lock, so two
+/// overlapping listings cannot both try the same move, and the in-memory
+/// recordings are updated so the caller resolves the files where they now are.
+///
+/// When the move fails, the old basename is pinned to the id instead: the files
+/// keep their old name but stay findable, which is never a duplicate download.
+/// `busy_id` is the recording being transcribed right now; its rename is
+/// deferred (the run writes its output against the audio path it captured).
+///
+/// Returns how many recordings were renamed on disk.
+pub fn reconcile_listing(
+    storage: &Storage,
+    settings: &AppSettings,
+    recordings: &mut [PlaudRecording],
+    busy_id: Option<&str>,
+) -> usize {
+    let root = PathBuf::from(&settings.download_dir);
+    let outcome = storage.edit_recordings_cache(|cached| {
+        let mut renamed = 0usize;
+        let mut changed = false;
+        for recording in recordings.iter_mut() {
+            let Some(entry) = cached.iter_mut().find(|c| c.id == recording.id) else {
+                continue;
+            };
+            if recording.local_basename.is_none() {
+                recording.local_basename = entry.local_basename.clone();
+            }
+            if entry.filename == recording.filename {
+                continue;
+            }
+
+            // The title the local files were named under.
+            let previous = PlaudRecording {
+                filename: entry.filename.clone(),
+                ..recording.clone()
+            };
+            let old_base = resolve_local_base(&root, &previous, settings);
+            let old_name = old_base
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string());
+            if !local_file_variants(&old_base).iter().any(|p| p.is_file()) {
+                // Nothing on disk: just take the new title.
+                entry.filename = recording.filename.clone();
+                changed = true;
+                continue;
+            }
+            if busy_id == Some(recording.id.as_str()) {
+                // Leave cache and files alone; the next listing mirrors it.
+                recording.filename = entry.filename.clone();
+                recording.local_basename = old_name;
+                continue;
+            }
+
+            match apply_local_rename(&root, settings, &previous, &recording.filename) {
+                Ok(basename) => {
+                    crate::login_log::info(&format!(
+                        "mirrored cloud rename \"{}\" -> \"{}\" on disk as {basename}",
+                        entry.filename, recording.filename
+                    ));
+                    recording.local_basename = Some(basename);
+                    renamed += 1;
+                }
+                Err(e) => {
+                    crate::login_log::warn(&format!(
+                        "cloud rename \"{}\" -> \"{}\" (id {}) not mirrored, keeping the old local name: {e}",
+                        entry.filename, recording.filename, recording.id
+                    ));
+                    recording.local_basename = old_name;
+                }
+            }
+            entry.filename = recording.filename.clone();
+            entry.local_basename = recording.local_basename.clone();
+            changed = true;
+        }
+        (renamed, changed)
+    });
+    outcome.unwrap_or_else(|e| {
+        crate::login_log::warn(&format!("could not update the recordings cache: {e}"));
+        0
+    })
+}
+
 /// Move a recording's local files to a new basename and fix the titles embedded
 /// inside them. Returns the basename actually used.
 ///
@@ -507,12 +552,15 @@ pub fn apply_local_rename(
         return Ok(current_name);
     }
 
-    // Never collide with a *different* recording's files.
+    // Never collide with a *different* recording's files. A case-only change
+    // ("meeting" -> "Meeting") is this recording's own files on a
+    // case-insensitive volume, not a collision.
     let mut final_name = new_name.clone();
     let taken = |candidate: &str| {
-        local_file_variants(&audio_dir(root, recording, settings).join(candidate))
-            .iter()
-            .any(|path| path.exists())
+        !candidate.eq_ignore_ascii_case(&current_name)
+            && local_file_variants(&audio_dir(root, recording, settings).join(candidate))
+                .iter()
+                .any(|path| path.exists())
     };
     if taken(&final_name) {
         let fragment: String = recording
@@ -535,22 +583,40 @@ pub fn apply_local_rename(
     let target_dir = audio_dir(root, recording, settings);
     fs::create_dir_all(&target_dir).map_err(|e| e.to_string())?;
 
-    // Move first, then fix embedded titles: a mid-way failure then leaves the
-    // files findable under one name rather than split across two.
-    let mut moved = 0usize;
+    // Move first, then fix embedded titles. A failure part-way through moves
+    // the files already done back, so they are never split across two names.
+    let case_only = final_name.eq_ignore_ascii_case(&current_name);
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut failure = None;
     for suffix in LOCAL_FILE_SUFFIXES {
         let from = local_file(&current_base, suffix);
         if !from.is_file() {
             continue;
         }
         let to = local_file(&target_dir.join(&final_name), suffix);
-        if to.exists() {
-            return Err(format!("Cannot rename: {} already exists.", to.display()));
+        if to.exists() && !case_only {
+            failure = Some(format!("Cannot rename: {} already exists.", to.display()));
+            break;
         }
-        fs::rename(&from, &to).map_err(|e| format!("Could not rename {}: {e}", from.display()))?;
-        moved += 1;
+        if let Err(e) = fs::rename(&from, &to) {
+            failure = Some(format!("Could not rename {}: {e}", from.display()));
+            break;
+        }
+        moved.push((from, to));
     }
-    if moved == 0 {
+    if let Some(failure) = failure {
+        for (from, to) in moved.iter().rev() {
+            if let Err(e) = fs::rename(to, from) {
+                crate::login_log::warn(&format!(
+                    "could not move {} back to {}: {e}",
+                    to.display(),
+                    from.display()
+                ));
+            }
+        }
+        return Err(failure);
+    }
+    if moved.is_empty() {
         return Err(format!(
             "No local files found for \"{}\" to rename.",
             recording.filename
@@ -592,7 +658,9 @@ fn rewrite_embedded_titles(base: &Path, new_title: &str) -> Result<(), String> {
                         .extension()
                         .map(|e| e.to_string_lossy().to_string())
                         .unwrap_or_else(|| "mp3".to_string());
-                    let updated = base.with_extension(&ext);
+                    // Appended as text: with_extension would cut a
+                    // basename that contains a dot ("Q3.5 Review").
+                    let updated = local_file(base, &format!(".{ext}"));
                     value["sourceAudio"] =
                         serde_json::Value::String(updated.to_string_lossy().to_string());
                     fs::write(
@@ -1099,6 +1167,191 @@ mod local_rename_tests {
         )
         .unwrap();
         base
+    }
+
+    fn storage_with(root: &Path, cached: &[PlaudRecording]) -> Storage {
+        let storage = Storage::new(root.join("app-data")).unwrap();
+        storage.save_recordings_cache(cached).unwrap();
+        storage
+    }
+
+    /// A fresh API listing: new title, no local state.
+    fn listed(filename: &str) -> PlaudRecording {
+        PlaudRecording {
+            local_basename: None,
+            ..rec(filename)
+        }
+    }
+
+    /// Review finding C2: the mirror moved the files but the loop kept
+    /// resolving the old basename, so the download guard missed and the
+    /// recording was downloaded a second time under its old name.
+    #[test]
+    fn mirrored_web_rename_resolves_to_the_moved_files() {
+        let root = scratch("reconcile-mirror");
+        let settings = settings(&root);
+        let mut before = rec("Original Name");
+        seed_files(&root, &settings, &before);
+        before.local_basename = Some("Original-Name".into());
+        let storage = storage_with(&root, &[before]);
+
+        let mut listing = vec![listed("Day 2 Accelerator")];
+        assert_eq!(
+            reconcile_listing(&storage, &settings, &mut listing, None),
+            1
+        );
+
+        assert_eq!(
+            listing[0].local_basename.as_deref(),
+            Some("Day-2-Accelerator")
+        );
+        let base = resolve_local_base(&root, &listing[0], &settings);
+        assert!(
+            local_audio(&base).is_some(),
+            "download guard must find the moved audio"
+        );
+        let cached = storage.cached_recording(&listing[0].id).unwrap();
+        assert_eq!(cached.filename, "Day 2 Accelerator");
+        assert_eq!(cached.local_basename.as_deref(), Some("Day-2-Accelerator"));
+    }
+
+    /// Review finding H1: list_recordings saved the new title over the cache
+    /// before any sync pass compared it, so the rename was never mirrored.
+    /// The listing path now reconciles first; a later pass then has nothing to
+    /// do and still finds the files.
+    #[test]
+    fn rename_seen_by_a_listing_is_not_lost_before_the_next_sync() {
+        let root = scratch("reconcile-list-then-sync");
+        let settings = settings(&root);
+        let mut before = rec("Original Name");
+        seed_files(&root, &settings, &before);
+        before.local_basename = Some("Original-Name".into());
+        let storage = storage_with(&root, &[before]);
+
+        // list_recordings: reconcile, then save the listing over the cache.
+        let mut ui_listing = vec![listed("Day 2 Accelerator")];
+        reconcile_listing(&storage, &settings, &mut ui_listing, None);
+        storage.save_recordings_cache(&ui_listing).unwrap();
+
+        // The next sync pass's own fresh listing.
+        let mut sync_listing = vec![listed("Day 2 Accelerator")];
+        assert_eq!(
+            reconcile_listing(&storage, &settings, &mut sync_listing, None),
+            0
+        );
+        let base = resolve_local_base(&root, &sync_listing[0], &settings);
+        assert_eq!(base.file_name().unwrap(), "Day-2-Accelerator");
+        assert!(local_audio(&base).is_some());
+    }
+
+    /// A library from before local_basename existed: files are named by the
+    /// old title and the cache has no basename. Still mirrored, not duplicated.
+    #[test]
+    fn legacy_entry_without_a_basename_is_mirrored() {
+        let root = scratch("reconcile-legacy");
+        let settings = settings(&root);
+        let before = rec("Original Name");
+        seed_files(&root, &settings, &before);
+        let storage = storage_with(&root, &[before]);
+
+        let mut listing = vec![listed("Day 2 Accelerator")];
+        assert_eq!(
+            reconcile_listing(&storage, &settings, &mut listing, None),
+            1
+        );
+        let base = resolve_local_base(&root, &listing[0], &settings);
+        assert!(local_audio(&base).is_some());
+    }
+
+    #[test]
+    fn rename_of_a_recording_with_no_local_files_just_takes_the_title() {
+        let root = scratch("reconcile-cloud-only");
+        let settings = settings(&root);
+        let storage = storage_with(&root, &[rec("Original Name")]);
+
+        let mut listing = vec![listed("Day 2 Accelerator")];
+        assert_eq!(
+            reconcile_listing(&storage, &settings, &mut listing, None),
+            0
+        );
+        let cached = storage.cached_recording(&listing[0].id).unwrap();
+        assert_eq!(cached.filename, "Day 2 Accelerator");
+    }
+
+    /// The recording being transcribed keeps its old name until the run ends,
+    /// and the cache keeps the old title so the next listing mirrors it.
+    #[test]
+    fn rename_of_the_recording_being_transcribed_is_deferred() {
+        let root = scratch("reconcile-busy");
+        let settings = settings(&root);
+        let mut before = rec("Original Name");
+        let old_base = seed_files(&root, &settings, &before);
+        before.local_basename = Some("Original-Name".into());
+        let storage = storage_with(&root, &[before.clone()]);
+
+        let mut listing = vec![listed("Day 2 Accelerator")];
+        let busy = Some(before.id.as_str());
+        assert_eq!(
+            reconcile_listing(&storage, &settings, &mut listing, busy),
+            0
+        );
+        assert!(
+            old_base.with_extension("mp3").is_file(),
+            "files must not move mid-run"
+        );
+        assert_eq!(resolve_local_base(&root, &listing[0], &settings), old_base);
+        assert_eq!(
+            storage.cached_recording(&before.id).unwrap().filename,
+            "Original Name"
+        );
+
+        // Run finished: the next listing mirrors it.
+        let mut listing = vec![listed("Day 2 Accelerator")];
+        assert_eq!(
+            reconcile_listing(&storage, &settings, &mut listing, None),
+            1
+        );
+    }
+
+    /// A save from a listing (which never carries a basename) must not wipe
+    /// one the cache already holds.
+    #[test]
+    fn saving_a_fresh_listing_keeps_the_cached_basename() {
+        let root = scratch("cache-keeps-basename");
+        let mut before = rec("Original Name");
+        before.local_basename = Some("Original-Name".into());
+        let storage = storage_with(&root, &[before.clone()]);
+
+        storage
+            .save_recordings_cache(&[listed("Original Name")])
+            .unwrap();
+        assert_eq!(
+            storage
+                .cached_recording(&before.id)
+                .unwrap()
+                .local_basename
+                .as_deref(),
+            Some("Original-Name")
+        );
+    }
+
+    /// Only the letter case changes: the existing files are this recording's
+    /// own (on a case-insensitive volume they "exist" under the new name too),
+    /// so no id suffix.
+    #[test]
+    fn case_only_rename_is_not_a_collision() {
+        let root = scratch("case-only");
+        let settings = settings(&root);
+        let recording = rec("meeting notes");
+        seed_files(&root, &settings, &recording);
+
+        let applied = apply_local_rename(&root, &settings, &recording, "Meeting Notes").unwrap();
+        assert_eq!(applied, "Meeting-Notes");
+        let renamed = PlaudRecording {
+            local_basename: Some(applied),
+            ..recording
+        };
+        assert!(local_audio(&resolve_local_base(&root, &renamed, &settings)).is_some());
     }
 
     #[test]
