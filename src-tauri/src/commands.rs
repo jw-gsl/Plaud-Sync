@@ -404,9 +404,7 @@ pub(crate) async fn transcribe_recording_inner(
 
     let root = std::path::PathBuf::from(&settings.download_dir);
     let base = crate::sync::resolve_local_base(&root, recording, &settings);
-    let audio_path = [base.clone(), base.with_extension("opus")]
-        .into_iter()
-        .find(|path| path.is_file())
+    let audio_path = crate::sync::local_audio(&base)
         .ok_or_else(|| "Download this recording before transcribing it locally.".to_string())?;
 
     // Transcriptions can run for hours, so the log needs to show that a run is
@@ -543,9 +541,13 @@ pub(crate) async fn auto_transcribe_new(app: &AppHandle) -> usize {
 
     // Fresh list from Plaud so newly-downloaded recordings are included.
     let mut client = PlaudClient::new(PlaudAuth::new(storage.clone()), storage.get_region());
-    let Ok(recordings) = client.list_recordings().await else {
+    let Ok(mut recordings) = client.list_recordings().await else {
         return 0;
     };
+    // Re-attach the id-keyed local basenames: a fresh listing has no local
+    // state, and without this a renamed recording's files look absent here and
+    // are never picked up for transcription.
+    storage.restore_local_basenames(&mut recordings);
     let deleted = storage.get_deleted_ids();
     let root = std::path::PathBuf::from(&settings.download_dir);
     let mut pending: Vec<PlaudRecording> = recordings
@@ -555,8 +557,12 @@ pub(crate) async fn auto_transcribe_new(app: &AppHandle) -> usize {
                 return false;
             }
             let base = crate::sync::resolve_local_base(&root, r, &settings);
-            let downloaded = base.exists() || base.with_extension("opus").exists();
-            let transcribed = base.with_extension("local.txt").exists();
+            // Use the shared suffix list so "x.local.txt" is not mistaken for
+            // the plain ".txt" Plaud transcript.
+            let downloaded = crate::sync::local_file_variants(&base)
+                .into_iter()
+                .any(|p| p.is_file());
+            let transcribed = crate::sync::local_file(&base, ".local.txt").exists();
             downloaded && !transcribed
         })
         .collect();
@@ -650,13 +656,10 @@ pub fn open_local_transcript(
     let settings = storage.get_settings();
     let root = std::path::PathBuf::from(&settings.download_dir);
     let base = crate::sync::resolve_local_base(&root, &recording, &settings);
-    let audio = [base.clone(), base.with_extension("opus")]
-        .into_iter()
-        .find(|path| path.is_file())
-        .ok_or_else(|| {
-            "Download this recording before opening its local transcript.".to_string()
-        })?;
-    let transcript = audio.with_extension("local.txt");
+    crate::sync::local_audio(&base).ok_or_else(|| {
+        "Download this recording before opening its local transcript.".to_string()
+    })?;
+    let transcript = crate::sync::local_file(&base, ".local.txt");
     if !transcript.is_file() {
         return Err("This recording has no local transcript yet.".to_string());
     }
@@ -672,13 +675,10 @@ pub fn read_local_transcript(
     let settings = storage.get_settings();
     let root = std::path::PathBuf::from(&settings.download_dir);
     let base = crate::sync::resolve_local_base(&root, &recording, &settings);
-    let audio = [base.clone(), base.with_extension("opus")]
-        .into_iter()
-        .find(|path| path.is_file())
-        .ok_or_else(|| {
-            "Download this recording before reading its local transcript.".to_string()
-        })?;
-    let transcript = audio.with_extension("local.txt");
+    crate::sync::local_audio(&base).ok_or_else(|| {
+        "Download this recording before reading its local transcript.".to_string()
+    })?;
+    let transcript = crate::sync::local_file(&base, ".local.txt");
     std::fs::read_to_string(&transcript)
         .map_err(|e| format!("Could not read local transcript: {e}"))
 }
@@ -1011,10 +1011,7 @@ pub fn reveal_recording(
     let root = std::path::PathBuf::from(&settings.download_dir);
     let base = crate::sync::resolve_local_base(&root, &recording, &settings);
 
-    // `base` ends in .mp3; the actual file may be .opus.
-    let file = [base.clone(), base.with_extension("opus")]
-        .into_iter()
-        .find(|p| p.exists());
+    let file = crate::sync::local_audio(&base);
 
     match file {
         Some(path) => reveal_in_file_manager(&path),

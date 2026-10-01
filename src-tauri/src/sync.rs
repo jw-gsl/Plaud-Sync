@@ -36,20 +36,20 @@ pub async fn sync_recordings(
     settings: &AppSettings,
 ) -> Result<SyncResult, String> {
     let mut client = PlaudClient::new(PlaudAuth::new(storage.clone()), storage.get_region());
-    let recordings = client.list_recordings().await?;
+    let listed_recordings = client.list_recordings().await?;
     // Never re-download recordings the user deleted locally.
     let deleted = storage.get_deleted_ids();
-    let listed = recordings.len();
-    let recordings: Vec<PlaudRecording> = recordings
+    let listed = listed_recordings.len();
+    let mut kept: Vec<PlaudRecording> = listed_recordings
         .into_iter()
         .filter(|r| !deleted.contains(&r.id))
         .collect();
     crate::login_log::debug(&format!(
         "sync: listed {listed} recordings, {} after excluding {} locally deleted",
-        recordings.len(),
-        listed - recordings.len()
+        kept.len(),
+        listed - kept.len()
     ));
-    download_list(app, storage, &mut client, &recordings, settings).await
+    download_list(app, storage, &mut client, &mut kept, settings).await
 }
 
 /// Download only the recordings whose ids are in `ids` (manual selection).
@@ -62,11 +62,11 @@ pub async fn download_selected(
     let mut client = PlaudClient::new(PlaudAuth::new(storage.clone()), storage.get_region());
     let all = client.list_recordings().await?;
     let deleted = storage.get_deleted_ids();
-    let subset: Vec<PlaudRecording> = all
+    let mut subset: Vec<PlaudRecording> = all
         .into_iter()
         .filter(|r| ids.iter().any(|id| id == &r.id) && !deleted.contains(&r.id))
         .collect();
-    download_list(app, storage, &mut client, &subset, settings).await
+    download_list(app, storage, &mut client, &mut subset, settings).await
 }
 
 /// Shared download loop. A failure on a single recording is non-fatal: it's
@@ -76,9 +76,14 @@ async fn download_list(
     app: &AppHandle,
     storage: &Storage,
     client: &mut PlaudClient,
-    recordings: &[PlaudRecording],
+    recordings: &mut [PlaudRecording],
     settings: &AppSettings,
 ) -> Result<SyncResult, String> {
+    // A fresh API listing knows nothing about local names, so re-attach the
+    // id-keyed basenames before anything resolves a path. Without this, an
+    // already-downloaded recording looks absent until something calls
+    // list_recordings, and auto-transcription misses renamed files.
+    storage.restore_local_basenames(recordings);
     let total = recordings.len();
     let download_root = PathBuf::from(&settings.download_dir);
     fs::create_dir_all(&download_root).map_err(|e| e.to_string())?;
@@ -119,6 +124,17 @@ async fn download_list(
                                 recording.filename, recording.id
                             ));
                         }
+                        // Also store the new title, otherwise the next sync sees
+                        // the same difference again and re-runs a rename whose
+                        // source name no longer exists.
+                        if let Err(e) =
+                            storage.update_cached_filename(&recording.id, &recording.filename)
+                        {
+                            crate::login_log::warn(&format!(
+                                "could not record renamed title for \"{}\" (id {}): {e}",
+                                recording.filename, recording.id
+                            ));
+                        }
                         renamed += 1;
                     }
                     Err(e) => crate::login_log::warn(&format!(
@@ -131,15 +147,8 @@ async fn download_list(
 
         // Resolve by recording id (local_basename) where known, so a cloud-side
         // rename cannot make an already-downloaded file look absent.
-        let audio_path =
-            resolve_local_base(&download_root, recording, settings).with_extension("mp3");
-        let on_disk = [
-            audio_path.clone(),
-            audio_path.with_extension("mp3"),
-            audio_path.with_extension("opus"),
-        ]
-        .into_iter()
-        .find(|p| p.exists());
+        let base = resolve_local_base(&download_root, recording, settings);
+        let on_disk = local_audio(&base);
         if let Some(existing) = on_disk {
             crate::login_log::debug(&format!(
                 "skip \"{}\" (id {}): already on disk at {}",
@@ -161,7 +170,7 @@ async fn download_list(
             },
         );
 
-        match download_one(client, recording, settings, &audio_path).await {
+        match download_one(client, recording, settings, &base).await {
             Ok(final_path) => {
                 // Record the basename actually written (after any collision
                 // suffixing) so later passes resolve by id, not by title.
@@ -226,9 +235,9 @@ async fn download_one(
     client: &mut PlaudClient,
     recording: &PlaudRecording,
     settings: &AppSettings,
-    audio_path: &Path,
+    base: &Path,
 ) -> Result<PathBuf, String> {
-    if let Some(parent) = audio_path.parent() {
+    if let Some(parent) = base.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
 
@@ -236,8 +245,9 @@ async fn download_one(
     if bytes.is_empty() {
         return Err("server returned an empty file (recording may still be processing)".into());
     }
-    // Honour the extension the API actually served (mp3 or opus).
-    let final_path = audio_path.with_extension(&ext);
+    // Honour the extension the API actually served (mp3 or opus), appended as
+    // literal text so a basename containing a dot survives.
+    let final_path = local_file(base, &format!(".{ext}"));
     fs::write(&final_path, &bytes).map_err(|e| e.to_string())?;
 
     if settings.download_transcript && recording.is_trans {
@@ -409,14 +419,7 @@ pub fn mark_downloaded_status(recordings: &mut [PlaudRecording], settings: &AppS
     let root = PathBuf::from(&settings.download_dir);
     for rec in recordings.iter_mut() {
         let base = resolve_local_base(&root, rec, settings);
-        let found = [
-            base.clone(),
-            base.with_extension("mp3"),
-            base.with_extension("opus"),
-        ]
-        .into_iter()
-        .find(|path| path.exists());
-        rec.downloaded = found.is_some();
+        rec.downloaded = local_audio(&base).is_some();
         // Backfill the id-keyed basename for libraries downloaded before this
         // field existed, so the next cloud-side rename can't strand the files.
         if rec.downloaded && rec.local_basename.is_none() {
@@ -431,10 +434,7 @@ pub fn mark_local_transcript_status(recordings: &mut [PlaudRecording], settings:
     let root = PathBuf::from(&settings.download_dir);
     for rec in recordings.iter_mut() {
         let base = resolve_local_base(&root, rec, settings);
-        let audio = [base.clone(), base.with_extension("opus")]
-            .into_iter()
-            .find(|path| path.is_file());
-        rec.local_transcript = audio
+        rec.local_transcript = local_audio(&base)
             .as_deref()
             .map(crate::transcription::local_transcript_exists)
             .unwrap_or(false);
@@ -632,6 +632,21 @@ pub fn local_file(base: &Path, suffix: &str) -> PathBuf {
 /// delete and rename so the two cannot drift apart.
 pub fn local_file_variants(base: &Path) -> [PathBuf; 5] {
     LOCAL_FILE_SUFFIXES.map(|suffix| local_file(base, suffix))
+}
+
+/// Audio suffixes Plaud serves a recording under.
+pub const AUDIO_FILE_SUFFIXES: [&str; 2] = [".mp3", ".opus"];
+
+/// The downloaded audio file for a recording, if it is present.
+///
+/// Not `base.with_extension("opus")`: with the original filename style a title
+/// can contain a dot ("Q3.5 Review"), and `with_extension` would replace
+/// everything after it, looking for "Q3.opus" instead of "Q3.5 Review.opus".
+pub fn local_audio(base: &Path) -> Option<PathBuf> {
+    AUDIO_FILE_SUFFIXES
+        .map(|suffix| local_file(base, suffix))
+        .into_iter()
+        .find(|path| path.is_file())
 }
 
 pub fn build_audio_path(
@@ -964,6 +979,30 @@ mod id_resolution_tests {
                 "2026-09-30-09-07-28.local.json",
             ]
         );
+    }
+
+    #[test]
+    fn a_dot_in_the_basename_does_not_swallow_the_suffix() {
+        // The original filename style keeps dots, so "Q3.5 Review" is a real
+        // basename. Path::with_extension would replace everything after the dot
+        // and look for "Q3.opus"; the suffix helpers must not.
+        let base = Path::new("/tmp/plaud/2026-09-30/Q3.5 Review");
+        assert_eq!(
+            local_file(base, ".mp3").file_name().unwrap(),
+            "Q3.5 Review.mp3"
+        );
+        assert_eq!(
+            local_file(base, ".local.txt").file_name().unwrap(),
+            "Q3.5 Review.local.txt"
+        );
+
+        let dir = std::env::temp_dir().join("plaud-dot-basename");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mp3 = local_file(&dir.join("Q3.5 Review"), ".mp3");
+        fs::write(&mp3, b"audio").unwrap();
+        assert_eq!(local_audio(&dir.join("Q3.5 Review")), Some(mp3));
+        assert_eq!(local_audio(&dir.join("Q3.5 Revie")), None);
     }
 
     #[test]

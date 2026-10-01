@@ -300,6 +300,24 @@ impl Storage {
             .map(|r| r.filename)
     }
 
+    /// Record a newly-observed title for a recording id, leaving the rest of
+    /// the cached entry alone.
+    ///
+    /// Needed after a sync mirrors a cloud rename: the local files moved, so the
+    /// old title must not linger or every later sync would try to rename from a
+    /// name that no longer exists.
+    pub fn update_cached_filename(&self, id: &str, filename: &str) -> Result<(), std::io::Error> {
+        let mut cached = self.get_recordings_cache();
+        match cached.iter_mut().find(|r| r.id == id) {
+            Some(slot) => {
+                slot.filename = filename.to_string();
+                self.write_recordings_cache(&cached)
+            }
+            // Not cached: nothing to rename against on the next pass either.
+            None => Ok(()),
+        }
+    }
+
     /// Restore `local_basename` onto a freshly-listed set of recordings, by id.
     ///
     /// The listing comes from the Plaud API and so has no local state on it;
