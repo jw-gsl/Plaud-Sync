@@ -49,7 +49,7 @@ pub async fn sync_recordings(
         recordings.len(),
         listed - recordings.len()
     ));
-    download_list(app, &mut client, &recordings, settings).await
+    download_list(app, storage, &mut client, &recordings, settings).await
 }
 
 /// Download only the recordings whose ids are in `ids` (manual selection).
@@ -66,7 +66,7 @@ pub async fn download_selected(
         .into_iter()
         .filter(|r| ids.iter().any(|id| id == &r.id) && !deleted.contains(&r.id))
         .collect();
-    download_list(app, &mut client, &subset, settings).await
+    download_list(app, storage, &mut client, &subset, settings).await
 }
 
 /// Shared download loop. A failure on a single recording is non-fatal: it's
@@ -74,6 +74,7 @@ pub async fn download_selected(
 /// can't block the rest or abort an auto-sync silently).
 async fn download_list(
     app: &AppHandle,
+    storage: &Storage,
     client: &mut PlaudClient,
     recordings: &[PlaudRecording],
     settings: &AppSettings,
@@ -97,8 +98,10 @@ async fn download_list(
             },
         );
 
-        // `build_audio_path` returns a `.mp3` base; the file may end up `.opus`.
-        let audio_path = build_audio_path(&download_root, recording, settings);
+        // Resolve by recording id (local_basename) where known, so a cloud-side
+        // rename cannot make an already-downloaded file look absent.
+        let audio_path =
+            resolve_local_base(&download_root, recording, settings).with_extension("mp3");
         let on_disk = [
             audio_path.clone(),
             audio_path.with_extension("mp3"),
@@ -129,6 +132,19 @@ async fn download_list(
 
         match download_one(client, recording, settings, &audio_path).await {
             Ok(final_path) => {
+                // Record the basename actually written (after any collision
+                // suffixing) so later passes resolve by id, not by title.
+                if let Some(basename) = final_path
+                    .file_stem()
+                    .map(|n| n.to_string_lossy().to_string())
+                {
+                    if let Err(e) = storage.set_local_basename(&recording.id, &basename) {
+                        crate::login_log::warn(&format!(
+                            "could not record local basename for \"{}\" (id {}): {e}",
+                            recording.filename, recording.id
+                        ));
+                    }
+                }
                 crate::login_log::info(&format!(
                     "downloaded \"{}\" (id {}) -> {}",
                     recording.filename,
@@ -354,17 +370,29 @@ pub async fn auto_sync_loop(app: AppHandle) {
 pub fn mark_downloaded_status(recordings: &mut [PlaudRecording], settings: &AppSettings) {
     let root = PathBuf::from(&settings.download_dir);
     for rec in recordings.iter_mut() {
-        let path = build_audio_path(&root, rec, settings);
-        rec.downloaded = path.exists()
-            || path.with_extension("mp3").exists()
-            || path.with_extension("opus").exists();
+        let base = resolve_local_base(&root, rec, settings);
+        let found = [
+            base.clone(),
+            base.with_extension("mp3"),
+            base.with_extension("opus"),
+        ]
+        .into_iter()
+        .find(|path| path.exists());
+        rec.downloaded = found.is_some();
+        // Backfill the id-keyed basename for libraries downloaded before this
+        // field existed, so the next cloud-side rename can't strand the files.
+        if rec.downloaded && rec.local_basename.is_none() {
+            rec.local_basename = base
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string());
+        }
     }
 }
 
 pub fn mark_local_transcript_status(recordings: &mut [PlaudRecording], settings: &AppSettings) {
     let root = PathBuf::from(&settings.download_dir);
     for rec in recordings.iter_mut() {
-        let base = build_audio_path(&root, rec, settings);
+        let base = resolve_local_base(&root, rec, settings);
         let audio = [base.clone(), base.with_extension("opus")]
             .into_iter()
             .find(|path| path.is_file());
@@ -375,36 +403,60 @@ pub fn mark_local_transcript_status(recordings: &mut [PlaudRecording], settings:
     }
 }
 
+/// Folder that holds this recording's files, per the user's folder-structure
+/// setting. The folder half of `build_audio_path`, shared so naming rules and
+/// layout rules each have exactly one definition.
+pub fn audio_dir(root: &Path, recording: &PlaudRecording, settings: &AppSettings) -> PathBuf {
+    let date = format_date(recording.start_time);
+    let prefix = sanitize_folder_name(&settings.custom_prefix);
+    match settings.folder_structure.as_str() {
+        "flat" => root.join(&prefix),
+        "by_date_device" => root
+            .join(&prefix)
+            .join(&date)
+            .join(device_folder_name(&recording.serial_number)),
+        _ => root.join(&prefix).join(&date),
+    }
+}
+
+/// Extensionless base path for this recording's local files.
+///
+/// Prefers the persisted `local_basename` so a cloud-side rename cannot strand
+/// the files; falls back to deriving from the title, which is what every
+/// install from before this field did (and is what `mark_downloaded_status`
+/// backfills).
+pub fn resolve_local_base(
+    root: &Path,
+    recording: &PlaudRecording,
+    settings: &AppSettings,
+) -> PathBuf {
+    match &recording.local_basename {
+        Some(basename) => audio_dir(root, recording, settings).join(basename),
+        None => build_audio_path(root, recording, settings).with_extension(""),
+    }
+}
+
+/// Every file a download or local transcription may have produced for a
+/// recording, derived from its extensionless base. One definition, shared by
+/// delete and rename so the two cannot drift apart.
+pub fn local_file_variants(base: &Path) -> [PathBuf; 5] {
+    [
+        base.with_extension("mp3"),
+        base.with_extension("opus"),
+        base.with_extension("txt"),
+        base.with_extension("local.txt"),
+        base.with_extension("local.json"),
+    ]
+}
+
 pub fn build_audio_path(
     root: &Path,
     recording: &PlaudRecording,
     settings: &AppSettings,
 ) -> PathBuf {
-    let date = format_date(recording.start_time);
-    let filename = build_filename(recording, settings);
-    let prefix = sanitize_folder_name(&settings.custom_prefix);
-
-    match settings.folder_structure.as_str() {
-        "flat" => root.join(&prefix).join(&filename).with_extension("mp3"),
-        "by_date_device" => {
-            let device = device_folder_name(&recording.serial_number);
-            root.join(&prefix)
-                .join(&date)
-                .join(&device)
-                .join(&filename)
-                .with_extension("mp3")
-        }
-        "custom_prefix" => root
-            .join(&prefix)
-            .join(&date)
-            .join(&filename)
-            .with_extension("mp3"),
-        _ => root
-            .join(&prefix)
-            .join(&date)
-            .join(&filename)
-            .with_extension("mp3"),
-    }
+    audio_dir(root, recording, settings)
+        .join(build_filename(recording, settings))
+        .with_extension("mp3")
 }
 
 pub fn example_path(settings: &AppSettings) -> String {
@@ -419,6 +471,7 @@ pub fn example_path(settings: &AppSettings) -> String {
         is_trans: true,
         serial_number: "NOTE-PRO-001".into(),
         downloaded: false,
+        local_basename: None,
         local_transcript: false,
     };
     build_audio_path(Path::new(settings.download_dir.as_str()), &sample, settings)
@@ -523,6 +576,7 @@ mod tests {
             serial_number: "NOTE-PRO-1".into(),
             downloaded: false,
             local_transcript: false,
+            local_basename: None,
         }
     }
 
@@ -603,5 +657,160 @@ mod tests {
     fn format_date_handles_invalid() {
         assert_eq!(format_date(0), "unknown-date");
         assert_eq!(format_date(-5), "unknown-date");
+    }
+}
+
+#[cfg(test)]
+mod id_resolution_tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    fn rec(id: &str, filename: &str) -> PlaudRecording {
+        PlaudRecording {
+            id: id.into(),
+            filename: filename.into(),
+            duration: 1_800_000,
+            start_time: Utc
+                .with_ymd_and_hms(2026, 9, 30, 9, 7, 28)
+                .unwrap()
+                .timestamp_millis(),
+            is_trans: false,
+            serial_number: "SN-1".into(),
+            downloaded: true,
+            local_transcript: false,
+            local_basename: None,
+        }
+    }
+
+    fn settings() -> AppSettings {
+        AppSettings {
+            download_dir: "/tmp/plaud".into(),
+            folder_structure: "by_date".into(),
+            custom_prefix: String::new(),
+            filename_style: "timestamp".into(),
+            ..AppSettings::default()
+        }
+    }
+
+    #[test]
+    fn resolve_local_base_prefers_persisted_basename() {
+        let root = Path::new("/tmp/plaud");
+        let mut recording = rec("abc", "Original Name");
+        recording.local_basename = Some("2026-09-30-09-07-28".into());
+        assert_eq!(
+            resolve_local_base(root, &recording, &settings()),
+            Path::new("/tmp/plaud/PlaudRecordings/2026-09-30/2026-09-30-09-07-28")
+        );
+    }
+
+    #[test]
+    fn resolve_local_base_falls_back_to_title_when_absent() {
+        let root = Path::new("/tmp/plaud");
+        let recording = rec("abc", "Original Name");
+        // No persisted basename: identical to the pre-fix behaviour, which is
+        // what every existing install relies on.
+        assert_eq!(
+            resolve_local_base(root, &recording, &settings()),
+            build_audio_path(root, &recording, &settings()).with_extension("")
+        );
+    }
+
+    /// The bug that motivated this: renaming in the Plaud web UI changed the
+    /// title, hence the derived path, so the file looked absent.
+    #[test]
+    fn resolve_local_base_is_stable_when_title_changes() {
+        let root = Path::new("/tmp/plaud");
+        let settings = settings();
+        let before = rec("abc", "Original Name");
+        let before_base = resolve_local_base(root, &before, &settings);
+
+        // Same id, renamed in the cloud, and the id-keyed basename is present
+        // (either saved at download or backfilled).
+        let mut after = rec("abc", "Day 2 Accelerator");
+        after.local_basename = before_base
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string());
+        assert_eq!(resolve_local_base(root, &after, &settings), before_base);
+
+        // Without it, the rename moves the path — this is the regression.
+        let mut unbackfilled = rec("abc", "Day 2 Accelerator");
+        unbackfilled.local_basename = None;
+        assert_ne!(
+            resolve_local_base(root, &unbackfilled, &settings),
+            before_base
+        );
+    }
+
+    #[test]
+    fn persisted_basename_survives_a_title_change_in_every_layout() {
+        for structure in ["flat", "by_date", "by_date_device", "custom_prefix"] {
+            let settings = AppSettings {
+                folder_structure: structure.into(),
+                ..settings()
+            };
+            let root = Path::new("/tmp/plaud");
+            let mut renamed = rec("abc", "Day 2 Accelerator");
+            renamed.local_basename = Some("stored-basename".into());
+            let resolved = resolve_local_base(root, &renamed, &settings);
+            assert_eq!(
+                resolved.file_name().unwrap(),
+                "stored-basename",
+                "layout {structure} lost the persisted basename"
+            );
+            // Folder still follows the date folder, not the title.
+            assert!(resolved.starts_with(Path::new("/tmp/plaud")));
+        }
+    }
+
+    #[test]
+    fn local_file_variants_cover_every_produced_artifact() {
+        let base = Path::new("/tmp/plaud/PlaudRecordings/2026-09-30/2026-09-30-09-07-28");
+        let names: Vec<String> = local_file_variants(base)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "2026-09-30-09-07-28.mp3",
+                "2026-09-30-09-07-28.opus",
+                "2026-09-30-09-07-28.txt",
+                "2026-09-30-09-07-28.local.txt",
+                "2026-09-30-09-07-28.local.json",
+            ]
+        );
+    }
+
+    #[test]
+    fn build_audio_path_layouts_are_unchanged() {
+        // audio_dir() was extracted from build_audio_path; pin each layout so
+        // the refactor cannot silently move anyone's files.
+        let root = Path::new("/tmp/plaud");
+        let recording = rec("abc", "Team Standup");
+        let with = |structure: &str| {
+            build_audio_path(
+                root,
+                &recording,
+                &AppSettings {
+                    folder_structure: structure.into(),
+                    custom_prefix: "Pfx".into(),
+                    filename_style: "clean".into(),
+                    ..AppSettings::default()
+                },
+            )
+        };
+        assert_eq!(with("flat"), Path::new("/tmp/plaud/Pfx/Team-Standup.mp3"));
+        assert_eq!(
+            with("by_date"),
+            Path::new("/tmp/plaud/Pfx/2026-09-30/Team-Standup.mp3")
+        );
+        assert_eq!(
+            with("by_date_device"),
+            Path::new("/tmp/plaud/Pfx/2026-09-30/SN-1/Team-Standup.mp3")
+        );
+        assert_eq!(
+            with("custom_prefix"),
+            Path::new("/tmp/plaud/Pfx/2026-09-30/Team-Standup.mp3")
+        );
     }
 }

@@ -139,6 +139,9 @@ pub async fn list_recordings(state: State<'_, AppState>) -> Result<Vec<PlaudReco
     let mut client = PlaudClient::new(auth, region);
 
     let mut recordings = client.list_recordings().await?;
+    // The API listing carries no local state; re-attach the id-keyed on-disk
+    // basename saved at download time.
+    storage.restore_local_basenames(&mut recordings);
     mark_downloaded_status(&mut recordings, &settings);
     mark_local_transcript_status(&mut recordings, &settings);
     // Hide locally-deleted recordings so they don't reappear after a resync.
@@ -400,7 +403,7 @@ pub(crate) async fn transcribe_recording_inner(
     }
 
     let root = std::path::PathBuf::from(&settings.download_dir);
-    let base = crate::sync::build_audio_path(&root, recording, &settings);
+    let base = crate::sync::resolve_local_base(&root, recording, &settings);
     let audio_path = [base.clone(), base.with_extension("opus")]
         .into_iter()
         .find(|path| path.is_file())
@@ -551,7 +554,7 @@ pub(crate) async fn auto_transcribe_new(app: &AppHandle) -> usize {
             if deleted.contains(&r.id) {
                 return false;
             }
-            let base = crate::sync::build_audio_path(&root, r, &settings);
+            let base = crate::sync::resolve_local_base(&root, r, &settings);
             let downloaded = base.exists() || base.with_extension("opus").exists();
             let transcribed = base.with_extension("local.txt").exists();
             downloaded && !transcribed
@@ -646,7 +649,7 @@ pub fn open_local_transcript(
     let storage = state.storage.lock().map_err(|e| e.to_string())?;
     let settings = storage.get_settings();
     let root = std::path::PathBuf::from(&settings.download_dir);
-    let base = crate::sync::build_audio_path(&root, &recording, &settings);
+    let base = crate::sync::resolve_local_base(&root, &recording, &settings);
     let audio = [base.clone(), base.with_extension("opus")]
         .into_iter()
         .find(|path| path.is_file())
@@ -668,7 +671,7 @@ pub fn read_local_transcript(
     let storage = state.storage.lock().map_err(|e| e.to_string())?;
     let settings = storage.get_settings();
     let root = std::path::PathBuf::from(&settings.download_dir);
-    let base = crate::sync::build_audio_path(&root, &recording, &settings);
+    let base = crate::sync::resolve_local_base(&root, &recording, &settings);
     let audio = [base.clone(), base.with_extension("opus")]
         .into_iter()
         .find(|path| path.is_file())
@@ -691,24 +694,30 @@ pub fn delete_local_recording(
     let storage = state.storage.lock().map_err(|e| e.to_string())?;
     let settings = storage.get_settings();
     let root = std::path::PathBuf::from(&settings.download_dir);
-    let base = crate::sync::build_audio_path(&root, &recording, &settings);
+    let base = crate::sync::resolve_local_base(&root, &recording, &settings);
+    let mut removed = 0usize;
     // Remove every file a download or local transcription may have produced.
-    for path in [
-        base.clone(),
-        base.with_extension("opus"),
-        base.with_extension("txt"),
-        base.with_extension("local.txt"),
-        base.with_extension("local.json"),
-    ] {
+    for path in crate::sync::local_file_variants(&base) {
         if path.is_file() {
             std::fs::remove_file(&path)
                 .map_err(|e| format!("Could not delete {}: {e}", path.display()))?;
+            removed += 1;
         }
     }
     // Remember it even if no files were present, so it stays out of the list.
     storage
         .add_deleted_id(&recording.id)
         .map_err(|e| e.to_string())?;
+    // Previously this returned Ok even when the derived path missed every file
+    // (easy to do: the path was derived from the cloud title, so a rename
+    // orphaned the files). The recording then vanished from the UI with all
+    // five files still on disk and no error anywhere.
+    if removed == 0 {
+        return Err(format!(
+            "No local files found for \"{}\". It may have been moved or deleted outside Plaud Sync.",
+            recording.filename
+        ));
+    }
     Ok(())
 }
 
@@ -947,7 +956,7 @@ pub fn reveal_recording(
     let storage = state.storage.lock().map_err(|e| e.to_string())?;
     let settings = storage.get_settings();
     let root = std::path::PathBuf::from(&settings.download_dir);
-    let base = crate::sync::build_audio_path(&root, &recording, &settings);
+    let base = crate::sync::resolve_local_base(&root, &recording, &settings);
 
     // `base` ends in .mp3; the actual file may be .opus.
     let file = [base.clone(), base.with_extension("opus")]
@@ -1004,6 +1013,7 @@ mod tests {
             serial_number: "sn".into(),
             downloaded: true,
             local_transcript: false,
+            local_basename: None,
         }
     }
 

@@ -324,6 +324,7 @@ fn parse_recording(item: &Value) -> Option<PlaudRecording> {
             .unwrap_or("")
             .to_string(),
         downloaded: false,
+        local_basename: None,
         local_transcript: false,
     })
 }

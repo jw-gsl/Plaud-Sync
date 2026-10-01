@@ -258,6 +258,51 @@ impl Storage {
         }
     }
 
+    /// Record the on-disk basename for a recording.
+    ///
+    /// The API response never carries it, so without this the id-keyed path
+    /// would be forgotten on the next refresh and the app would fall back to
+    /// deriving the path from the cloud title — the bug this field exists to
+    /// fix. No-op when the recording is not cached yet (`list_recordings`
+    /// persists it on the next pass).
+    pub fn set_local_basename(&self, id: &str, basename: &str) -> Result<(), std::io::Error> {
+        let mut cached = self.get_recordings_cache();
+        let Some(recording) = cached.iter_mut().find(|r| r.id == id) else {
+            return Ok(());
+        };
+        if recording.local_basename.as_deref() == Some(basename) {
+            return Ok(());
+        }
+        recording.local_basename = Some(basename.to_string());
+        self.write_recordings_cache(&cached)
+    }
+
+    fn write_recordings_cache(&self, recordings: &[PlaudRecording]) -> Result<(), std::io::Error> {
+        let raw = serde_json::to_vec(recordings)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        fs::write(self.cache_path(), raw)
+    }
+
+    /// Restore `local_basename` onto a freshly-listed set of recordings, by id.
+    ///
+    /// The listing comes from the Plaud API and so has no local state on it;
+    /// without this merge the id-keyed basename would be dropped on every
+    /// refresh.
+    pub fn restore_local_basenames(&self, recordings: &mut [PlaudRecording]) {
+        let cached = self.get_recordings_cache();
+        if cached.is_empty() {
+            return;
+        }
+        for recording in recordings.iter_mut() {
+            if recording.local_basename.is_none() {
+                recording.local_basename = cached
+                    .iter()
+                    .find(|c| c.id == recording.id)
+                    .and_then(|c| c.local_basename.clone());
+            }
+        }
+    }
+
     pub fn get_settings(&self) -> AppSettings {
         self.load().settings.unwrap_or_default()
     }
