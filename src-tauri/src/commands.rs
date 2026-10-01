@@ -406,6 +406,22 @@ pub(crate) async fn transcribe_recording_inner(
         .find(|path| path.is_file())
         .ok_or_else(|| "Download this recording before transcribing it locally.".to_string())?;
 
+    // Transcriptions can run for hours, so the log needs to show that a run is
+    // alive and advancing. Without this, "slow" and "wedged" look identical
+    // from outside the process.
+    let started = std::time::Instant::now();
+    crate::login_log::info(&format!(
+        "transcribe start: \"{}\" (id {}) model={} audio={:.1} min file={}",
+        recording.filename,
+        recording.id,
+        spec.id,
+        recording.duration as f64 / 60_000.0,
+        audio_path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default(),
+    ));
+
     let emit_progress = |percent: u8, stage: &str| {
         let _ = app.emit(
             "local-transcription-progress",
@@ -428,6 +444,10 @@ pub(crate) async fn transcribe_recording_inner(
     let recording_id_for_emit = recording.id.clone();
     let filename_for_emit = recording.filename.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
+        // Log every stage change, plus a heartbeat every 30s: a single stage
+        // (diarization on a long recording) can run for many minutes with no
+        // other output, which is what made long runs look hung.
+        let last_logged = std::sync::Mutex::new((String::new(), started));
         let progress = |percent: u8, stage: &str| {
             let _ = app_for_worker.emit(
                 "local-transcription-progress",
@@ -438,6 +458,17 @@ pub(crate) async fn transcribe_recording_inner(
                     stage: stage.to_string(),
                 },
             );
+            if let Ok(mut last) = last_logged.lock() {
+                let stage_changed = last.0 != stage;
+                let heartbeat_due = last.1.elapsed() >= std::time::Duration::from_secs(30);
+                if stage_changed || heartbeat_due {
+                    crate::login_log::info(&format!(
+                        "transcribe progress: {percent}% {stage} ({})",
+                        format_elapsed(started.elapsed())
+                    ));
+                    *last = (stage.to_string(), std::time::Instant::now());
+                }
+            }
         };
         crate::transcription::transcribe_file(
             &audio_for_worker,
@@ -449,9 +480,27 @@ pub(crate) async fn transcribe_recording_inner(
         )
     })
     .await
-    .map_err(|e| format!("Local transcription worker failed: {e}"))??;
-    emit_progress(100, "Transcript saved");
-    Ok(result)
+    .map_err(|e| format!("Local transcription worker failed: {e}"))?;
+    match &result {
+        Ok(transcript) => {
+            crate::login_log::info(&format!(
+                "transcribe done: \"{}\" in {} ({} chars, {} speaker(s), vad={}, diarization={})",
+                recording.filename,
+                format_elapsed(started.elapsed()),
+                transcript.text.chars().count(),
+                transcript.speaker_count,
+                transcript.used_vad,
+                transcript.used_diarization
+            ));
+            emit_progress(100, "Transcript saved");
+        }
+        Err(e) => crate::login_log::warn(&format!(
+            "transcribe failed: \"{}\" after {}: {e}",
+            recording.filename,
+            format_elapsed(started.elapsed())
+        )),
+    }
+    result
 }
 
 /// Ask a running local transcription to stop. The blocking worker polls the
@@ -508,12 +557,21 @@ pub(crate) async fn auto_transcribe_new(app: &AppHandle) -> usize {
             downloaded && !transcribed
         })
         .collect();
-    // Drain a backlog oldest-first: Plaud's list is newest-first, which would
-    // otherwise make every new download cut in front of the backlog forever.
-    pending.sort_by_key(|recording| recording.start_time);
+    let now_ms = crate::state::now_epoch() * 1000;
+    order_transcribe_queue(&mut pending, now_ms);
     if pending.is_empty() {
         return 0;
     }
+    let backlog_mins: f64 = pending
+        .iter()
+        .map(|recording| recording.duration as f64 / 60_000.0)
+        .sum();
+    crate::login_log::info(&format!(
+        "auto-transcribe: {} pending ({:.1} min of audio), model={}",
+        pending.len(),
+        backlog_mins,
+        settings.transcription_model,
+    ));
 
     // Ensure the models are installed, downloading once if missing.
     let Ok(app_data) = app.path().app_data_dir() else {
@@ -560,8 +618,14 @@ pub(crate) async fn auto_transcribe_new(app: &AppHandle) -> usize {
     }
 
     let mut transcribed = 0usize;
-    for recording in pending {
-        match transcribe_recording_inner(app, &recording).await {
+    for (index, recording) in pending.iter().enumerate() {
+        crate::login_log::info(&format!(
+            "auto-transcribe: [{}/{}] {}",
+            index + 1,
+            pending.len(),
+            recording.filename
+        ));
+        match transcribe_recording_inner(app, recording).await {
             Ok(_) => transcribed += 1,
             // A user cancel stops the whole auto pass (don't march on to the next).
             Err(e) if e.to_lowercase().contains("cancel") => break,
@@ -646,6 +710,46 @@ pub fn delete_local_recording(
         .add_deleted_id(&recording.id)
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Recordings from this window jump the auto-transcribe queue ahead of older
+/// backlog, which still drains oldest-first so it cannot starve.
+const RECENT_TRANSCRIBE_WINDOW_MS: i64 = 48 * 60 * 60 * 1000;
+
+/// Order the auto-transcribe queue: newest-first inside the recent window, then
+/// the older backlog oldest-first.
+///
+/// Pure newest-first means a large backlog never drains. Pure oldest-first
+/// (v0.5.0) parks whatever was just recorded behind every older file, which is
+/// what the user hit when a fresh meeting sat behind 7 hours of audio. Grouping
+/// on recency keeps new recordings responsive while the backlog still drains.
+fn order_transcribe_queue(pending: &mut [PlaudRecording], now_ms: i64) {
+    pending.sort_by_key(|recording| {
+        let recent = recording.start_time >= now_ms - RECENT_TRANSCRIBE_WINDOW_MS;
+        // `!recent` sorts the recent group ahead of the backlog. Negating
+        // start_time inside that group makes a plain ascending sort yield
+        // newest-first there, while the backlog below keeps oldest-first.
+        (
+            !recent,
+            if recent {
+                -recording.start_time
+            } else {
+                recording.start_time
+            },
+        )
+    });
+}
+
+/// Compact elapsed-time label for the debug log ("4m 12s", "2h 05m").
+fn format_elapsed(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs >= 3600 {
+        format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    }
 }
 
 struct TranscriptionPermit<'a>(&'a std::sync::atomic::AtomicBool);
@@ -876,5 +980,89 @@ fn reveal_in_file_manager(path: &std::path::Path) -> Result<(), String> {
     {
         let dir = path.parent().unwrap_or(path);
         open::that(dir).map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plaud::types::PlaudRecording;
+
+    fn at(start_time: i64) -> PlaudRecording {
+        PlaudRecording {
+            id: format!("id-{start_time}"),
+            filename: format!("file-{start_time}"),
+            duration: 60_000,
+            start_time,
+            is_trans: false,
+            serial_number: "sn".into(),
+            downloaded: true,
+            local_transcript: false,
+        }
+    }
+
+    const HOUR_MS: i64 = 3_600_000;
+
+    #[test]
+    fn recent_recordings_go_first_newest_first() {
+        let now = 1_000 * HOUR_MS;
+        let mut pending = vec![
+            at(now - 2 * HOUR_MS),  // recent, older
+            at(now - 30 * 60_000),  // recent, newest
+            at(now - 20 * HOUR_MS), // backlog
+            at(now - 5 * HOUR_MS),  // recent, middle
+        ];
+        order_transcribe_queue(&mut pending, now);
+        let order: Vec<i64> = pending.iter().map(|r| r.start_time).collect();
+        assert_eq!(
+            order,
+            vec![
+                now - 30 * 60_000, // newest recent first
+                now - 2 * HOUR_MS,
+                now - 5 * HOUR_MS,
+                now - 20 * HOUR_MS, // backlog oldest-first, still drains
+            ]
+        );
+    }
+
+    #[test]
+    fn backlog_alone_drains_oldest_first_and_does_not_starve() {
+        let now = 1_000 * HOUR_MS;
+        // All older than the 48h window.
+        let mut pending = vec![
+            at(now - 72 * HOUR_MS),
+            at(now - 200 * HOUR_MS),
+            at(now - 100 * HOUR_MS),
+        ];
+        order_transcribe_queue(&mut pending, now);
+        let order: Vec<i64> = pending.iter().map(|r| r.start_time).collect();
+        assert_eq!(
+            order,
+            vec![now - 200 * HOUR_MS, now - 100 * HOUR_MS, now - 72 * HOUR_MS]
+        );
+    }
+
+    #[test]
+    fn everything_recent_orders_newest_first() {
+        let now = 1_000 * HOUR_MS;
+        let mut pending = vec![
+            at(now - 3 * HOUR_MS),
+            at(now - HOUR_MS),
+            at(now - 2 * HOUR_MS),
+        ];
+        order_transcribe_queue(&mut pending, now);
+        let order: Vec<i64> = pending.iter().map(|r| r.start_time).collect();
+        assert_eq!(
+            order,
+            vec![now - HOUR_MS, now - 2 * HOUR_MS, now - 3 * HOUR_MS]
+        );
+    }
+
+    #[test]
+    fn elapsed_formats_compactly() {
+        use std::time::Duration;
+        assert_eq!(format_elapsed(Duration::from_secs(9)), "9s");
+        assert_eq!(format_elapsed(Duration::from_secs(65)), "1m 05s");
+        assert_eq!(format_elapsed(Duration::from_secs(3720)), "1h 02m");
     }
 }
