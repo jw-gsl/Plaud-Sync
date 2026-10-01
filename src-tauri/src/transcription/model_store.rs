@@ -200,7 +200,7 @@ pub const MODEL_SPECS: &[ModelSpec] = &[
     ModelSpec {
         id: "whisper-turbo-int8",
         name: "Whisper Large v3 Turbo (INT8)",
-        description: "Whisper accuracy on accented and non-native English at roughly 8x the decode speed of Large v3. A ~1.0 GB download. English transcription.",
+        description: "Whisper accuracy on accented and non-native English, far faster than Large v3: it has 4 decoder layers instead of 32, and both per-token decode cost and KV-cache size scale with decoder depth. A ~1.0 GB download. English transcription.",
         engine: EngineKind::Whisper,
         repo: "https://huggingface.co/csukuangfj/sherpa-onnx-whisper-turbo",
         revision: "2ca6ff69fc878651b770880507669577ac41c2ff",
