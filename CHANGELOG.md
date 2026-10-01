@@ -7,6 +7,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The app updates itself from the rolling `plaud-sync-latest` GitHub release; the
 notes for each published version are taken from this file.
 
+## [0.6.0] - 2026-10-01
+
+### Added
+- Rename a recording from its row (Rename button, or double-click the name).
+  The new name is saved to Plaud and the local audio, transcript and metadata
+  files are renamed to match. Renames made in the Plaud web or phone app are
+  picked up on the next refresh.
+- Whisper Large v3 Turbo as a transcription model: close to Large v3 accuracy
+  with a fraction of the decoder work. Large v3's description now says how
+  slow it is.
+- Transcription is logged: start, a heartbeat while it runs, and finish with
+  elapsed time, so a long run can be told apart from a stuck one.
+
+### Changed
+- Auto-transcribe does recordings from the last 48 hours first (newest
+  first), then works through the older backlog oldest-first.
+
+### Fixed
+- Renaming a recording in Plaud no longer makes the app download it again and
+  transcribe it a second time. Local files are now tracked by recording id
+  rather than by title.
+- Delete reports an error when it finds no local files, instead of claiming
+  success.
+- Speaker identification produces far fewer phantom speakers (a 2-person call
+  went from 28 labels to 7), and the speaker count is the number of distinct
+  speakers rather than the highest label.
+- Two sync passes can no longer run at once and download the same file twice.
+- Ticking a recording's transcribe checkbox no longer opens Finder.
+- Recording names are no longer cut down to 1-3 characters on transcribed rows.
+
 ## [0.4.8] - 2026-09-25
 
 ### Added
