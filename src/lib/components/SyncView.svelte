@@ -698,9 +698,9 @@
             {:else}
               <span class="dot done"></span>
             {/if}
-            <span class="rec-name">{recording.filename}</span>
+            <span class="rec-name" title={recording.filename}>{recording.filename}</span>
             <span class="rec-meta">
-              {formatDate(recording.startTime)} · {formatDuration(recording.duration)}{#if recording.isTrans} · TXT{/if}{#if recording.localTranscript} · Local TXT{/if}
+              {formatDate(recording.startTime)} · {formatDuration(recording.duration)}{#if recording.isTrans}{" · TXT"}{/if}{#if recording.localTranscript}{" · Local TXT"}{/if}
             </span>
             <span class="rec-state done">
               {#if localTranscribing === recording.id}
@@ -782,9 +782,9 @@
             {:else}
               <span class="dot new"></span>
             {/if}
-            <span class="rec-name">{recording.filename}</span>
+            <span class="rec-name" title={recording.filename}>{recording.filename}</span>
             <span class="rec-meta">
-              {formatDate(recording.startTime)} · {formatDuration(recording.duration)}{#if recording.isTrans} · TXT{/if}
+              {formatDate(recording.startTime)} · {formatDuration(recording.duration)}{#if recording.isTrans}{" · TXT"}{/if}
             </span>
             <span class="rec-state new">New</span>
           </div>
@@ -980,6 +980,8 @@
   .rec-row {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
+    row-gap: 4px;
     gap: 12px;
     padding: 10px 8px;
     background: transparent;
@@ -1017,8 +1019,12 @@
     background: var(--primary);
   }
   .rec-name {
-    flex: 1;
-    min-width: 0;
+    /* Every other child of .rec-row is `flex: none`, so the name is the only
+       element that can absorb overflow. Without a floor it collapses to an
+       ellipsis on transcribed rows, which carry the longest meta text and
+       three buttons. Keep a readable minimum and let the meta yield first. */
+    flex: 1 1 18rem;
+    min-width: 12rem;
     font-size: 0.88rem;
     font-weight: 500;
     overflow: hidden;
@@ -1029,7 +1035,10 @@
     color: var(--text-muted);
     font-size: 0.76rem;
     white-space: nowrap;
-    flex: none;
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   .rec-state {
     font-size: 0.68rem;
