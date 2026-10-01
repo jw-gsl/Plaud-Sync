@@ -107,6 +107,105 @@ impl PlaudClient {
         }
     }
 
+    /// Authenticated PATCH. The mirror image of `send_get`, so a write can be
+    /// replayed with a fresh token after a 401 without duplicating the header set.
+    async fn send_patch(
+        &self,
+        url: &str,
+        token: &str,
+        body: &Value,
+    ) -> Result<reqwest::Response, String> {
+        browser_headers(self.http.patch(url))
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json")
+            .header("app-platform", "web")
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| format!("Network error: {e}"))
+    }
+
+    /// PATCH with the same bounded region-redirect handling and one forced
+    /// token refresh on 401 as `request`. Deliberately a mirror rather than a
+    /// bypass: a write that skipped this could half-apply across a region hop.
+    async fn request_patch(&mut self, path: &str, body: &Value) -> Result<Value, String> {
+        let mut redirects = 0u8;
+        let mut visited_bases = HashSet::from([self.base_url()]);
+        loop {
+            let url = format!("{}{}", self.base_url(), path);
+            let token = self.auth.get_token().await?;
+            let mut res = self.send_patch(&url, &token, body).await?;
+
+            if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+                crate::login_log::info(
+                    "got 401 from rename API — refreshing token and retrying once",
+                );
+                let token = self.auth.force_refresh().await?;
+                res = self.send_patch(&url, &token, body).await?;
+            }
+
+            if !res.status().is_success() {
+                return Err(format!("Plaud API error: {}", res.status()));
+            }
+
+            let data: Value = res
+                .json()
+                .await
+                .map_err(|e| format!("Invalid API response: {e}"))?;
+
+            if data.get("status").and_then(|s| s.as_i64()) == Some(-302) {
+                if let Some(domain) = data.pointer("/data/domains/api").and_then(|d| d.as_str()) {
+                    match next_region_redirect(
+                        &self.region,
+                        domain,
+                        &mut redirects,
+                        &mut visited_bases,
+                    ) {
+                        Ok(Some(region)) => {
+                            crate::login_log::info(&format!(
+                                "region redirect on rename: '{}' -> '{region}'",
+                                self.region
+                            ));
+                            self.auth.persist_region(&region);
+                            self.region = region;
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            crate::login_log::error(&e);
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+
+            return Ok(data);
+        }
+    }
+
+    /// Rename a recording in the cloud.
+    ///
+    /// Verified by capture: `PATCH /file/{id}` with body `{"filename": "..."}`.
+    /// The write key is `filename`, even though reads return `file_name` — do
+    /// not "fix" this to match. The web UI also sends
+    /// `extra_data.actionData.hasTitleEdit`, which looks like telemetry; it is
+    /// omitted here and the bare body confirmed to return 200 + status 0.
+    pub async fn rename_recording(&mut self, id: &str, new_name: &str) -> Result<Value, String> {
+        let body = serde_json::json!({ "filename": new_name });
+        let data = self.request_patch(&format!("/file/{id}"), &body).await?;
+        let status = data.get("status").and_then(|s| s.as_i64());
+        if let Some(status) = status {
+            if status != 0 {
+                let msg = data
+                    .get("msg")
+                    .and_then(|m| m.as_str())
+                    .unwrap_or("no message");
+                return Err(format!("Plaud rejected the rename: {msg}"));
+            }
+        }
+        Ok(data)
+    }
+
     pub async fn list_recordings(&mut self) -> Result<Vec<PlaudRecording>, String> {
         let data = self.request("/file/simple/web").await?;
         let list = data

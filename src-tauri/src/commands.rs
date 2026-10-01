@@ -799,6 +799,59 @@ pub async fn sync_now(
     Ok(result)
 }
 
+/// Rename a recording in the Plaud cloud and mirror it locally.
+///
+/// Ordering is not negotiable: **cloud first**. If the local step fails after a
+/// successful write, the cloud is already correct, so we persist the new title,
+/// leave `local_basename` pointing at the old name and let the sync mirror
+/// repair it next pass. A local-first order would be reverted by the next sync
+/// (which reads the title from the cloud) and is indistinguishable from data
+/// loss.
+#[tauri::command]
+pub async fn rename_recording(
+    recording: PlaudRecording,
+    new_name: String,
+    state: State<'_, AppState>,
+) -> Result<PlaudRecording, String> {
+    let new_name = new_name.trim();
+    if new_name.is_empty() {
+        return Err("A new name cannot be empty.".to_string());
+    }
+    if new_name == recording.filename {
+        return Ok(recording);
+    }
+
+    let storage = state.storage.lock().map_err(|e| e.to_string())?.clone();
+    let settings = storage.get_settings();
+    let mut client = PlaudClient::new(PlaudAuth::new(storage.clone()), storage.get_region());
+
+    // 1. Cloud. On failure, touch nothing on disk.
+    client
+        .rename_recording(&recording.id, new_name)
+        .await
+        .map_err(|e| format!("Could not rename in Plaud: {e}"))?;
+
+    // 2. Local mirror. Best-effort: the cloud write already succeeded.
+    let root = std::path::PathBuf::from(&settings.download_dir);
+    let mut updated = recording.clone();
+    updated.filename = new_name.to_string();
+    match crate::sync::apply_local_rename(&root, &settings, &recording, new_name) {
+        Ok(basename) => {
+            updated.local_basename = Some(basename);
+        }
+        Err(e) => {
+            crate::login_log::warn(&format!(
+                "renamed \"{}\" in the cloud but not on disk: {e}",
+                recording.filename
+            ));
+        }
+    }
+
+    // 3. Persist, so the next list shows the new title without a refetch.
+    storage.update_cached_recording(&updated);
+    Ok(updated)
+}
+
 #[tauri::command]
 pub async fn download_selected(
     app: AppHandle,

@@ -106,6 +106,7 @@ pub fn run() {
             commands::open_local_transcript,
             commands::read_local_transcript,
             commands::delete_local_recording,
+            commands::rename_recording,
             commands::log_client_error,
         ])
         .run(tauri::generate_context!())

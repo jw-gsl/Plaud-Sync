@@ -283,6 +283,23 @@ impl Storage {
         fs::write(self.cache_path(), raw)
     }
 
+    /// Replace one recording in the cache (e.g. after a rename), matching on id.
+    pub fn update_cached_recording(&self, updated: &PlaudRecording) {
+        let mut cached = self.get_recordings_cache();
+        if let Some(slot) = cached.iter_mut().find(|r| r.id == updated.id) {
+            *slot = updated.clone();
+            let _ = self.write_recordings_cache(&cached);
+        }
+    }
+
+    /// Cached title for a recording id, used to detect renames made elsewhere.
+    pub fn cached_filename(&self, id: &str) -> Option<String> {
+        self.get_recordings_cache()
+            .into_iter()
+            .find(|r| r.id == id)
+            .map(|r| r.filename)
+    }
+
     /// Restore `local_basename` onto a freshly-listed set of recordings, by id.
     ///
     /// The listing comes from the Plaud API and so has no local state on it;
