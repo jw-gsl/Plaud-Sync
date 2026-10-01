@@ -42,6 +42,7 @@ pub fn run() {
                 // downloads any new recordings within ~60s of launch instead of
                 // waiting a full interval.
                 last_sync_epoch: std::sync::atomic::AtomicI64::new(0),
+                sync_running: std::sync::atomic::AtomicBool::new(false),
                 local_transcription_running: std::sync::atomic::AtomicBool::new(false),
                 local_transcription_cancelled: std::sync::Arc::new(
                     std::sync::atomic::AtomicBool::new(false),

@@ -780,7 +780,9 @@ pub async fn sync_now(
         return Err("Please choose a save folder in Settings first.".into());
     }
 
-    let result = sync_recordings(&app, &storage, &settings).await?;
+    let result = state
+        .run_sync_pass("manual sync", || sync_recordings(&app, &storage, &settings))
+        .await?;
     state.last_sync_epoch.store(
         crate::state::now_epoch(),
         std::sync::atomic::Ordering::Relaxed,
@@ -801,7 +803,11 @@ pub async fn download_selected(
         return Err("Please choose a save folder in Settings first.".into());
     }
 
-    let result = crate::sync::download_selected(&app, &storage, &settings, &ids).await?;
+    let result = state
+        .run_sync_pass("selected download", || {
+            crate::sync::download_selected(&app, &storage, &settings, &ids)
+        })
+        .await?;
     state.last_sync_epoch.store(
         crate::state::now_epoch(),
         std::sync::atomic::Ordering::Relaxed,

@@ -281,7 +281,28 @@ pub async fn auto_sync_loop(app: AppHandle) {
             continue;
         }
 
-        match sync_recordings(&app, &storage, &settings).await {
+        let app_for_pass = app.clone();
+        let pass = app
+            .state::<AppState>()
+            .run_sync_pass("auto-sync", move || {
+                let storage = storage.clone();
+                let settings = settings.clone();
+                let app = app_for_pass.clone();
+                async move { sync_recordings(&app, &storage, &settings).await }
+            })
+            .await;
+        // A manual sync or a selected download already holds the guard: skip
+        // this tick rather than racing it (racing meant double-downloading the
+        // same files, and could double-enqueue them for transcription).
+        let pass = match pass {
+            Ok(result) => Ok(result),
+            Err(ref e) if e.contains("already running") => {
+                crate::login_log::debug(&format!("auto-sync: skipped — {e}"));
+                continue;
+            }
+            Err(e) => Err(e),
+        };
+        match pass {
             Ok(result) => {
                 if consecutive_failures > 0 {
                     crate::login_log::info("auto-sync recovered after earlier failures");
