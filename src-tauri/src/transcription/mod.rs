@@ -1,5 +1,6 @@
 mod audio;
 pub mod model_store;
+mod speaker_merge;
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,7 +13,8 @@ use sherpa_onnx::{
     FastClusteringConfig, OfflineRecognizer, OfflineRecognizerConfig, OfflineSpeakerDiarization,
     OfflineSpeakerDiarizationConfig, OfflineSpeakerSegmentationModelConfig,
     OfflineSpeakerSegmentationPyannoteModelConfig, OfflineTransducerModelConfig,
-    OfflineWhisperModelConfig, SileroVadModelConfig, VadModelConfig, VoiceActivityDetector,
+    OfflineWhisperModelConfig, SileroVadModelConfig, SpeakerEmbeddingExtractor,
+    SpeakerEmbeddingExtractorConfig, VadModelConfig, VoiceActivityDetector,
 };
 
 pub use model_store::{
@@ -710,6 +712,27 @@ fn obtain_diarizer(
     Some((created, None))
 }
 
+/// Speaker pipeline: cluster at CLUSTERING_THRESHOLD (a distance: higher
+/// merges more, giving fewer speakers), merge clusters whose whole-cluster
+/// voice prints reach SPEAKER_MERGE_SIMILARITY, then fold speakers with less
+/// than MIN_SPEAKER_SECS of talk into their neighbour.
+///
+/// Chosen with the diar_eval bench against meetings with hand-confirmed
+/// speakers: share of speech given to the wrong person, and average extra
+/// speakers. Tuned on 18 meetings, then checked on 12 held-out ones:
+///
+///                                 tuning          held out
+///   0.55 alone (<= v0.5.0)        31.7%  +20.9    -
+///   1.10 alone (v0.6.0)           15.8%   +1.9    10.4%  +1.5
+///   0.85 + merge 0.70 + fold 8s   11.2%   -0.1     6.4%  -0.1
+///
+/// 1.10 alone looked best on speaker *count*, but it merged different people
+/// in 2 of 7 meetings with 4+ speakers (30% and 37% wrong). Clustering
+/// conservatively and merging on whole-cluster voice prints avoids that.
+const CLUSTERING_THRESHOLD: f32 = 0.85;
+const SPEAKER_MERGE_SIMILARITY: f32 = 0.70;
+const MIN_SPEAKER_SECS: f32 = 8.0;
+
 fn create_diarizer(paths: &model_store::PipelineModelPaths) -> Option<OfflineSpeakerDiarization> {
     let mut config = OfflineSpeakerDiarizationConfig::default();
     // 8 threads measured (bench below): the 4-thread cap sat at the plateau;
@@ -725,17 +748,24 @@ fn create_diarizer(paths: &model_store::PipelineModelPaths) -> Option<OfflineSpe
     config.embedding.model = Some(paths.embedding.to_string_lossy().to_string());
     config.embedding.num_threads = recommended_threads().min(8);
     config.embedding.provider = Some("cpu".to_string());
-    // Distance cut-off: higher merges more, giving fewer speakers. 0.55
-    // labelled a 2-person consult as 28 speakers. Swept with
-    // diar_threshold_sweep on known counts (2, 2, ~4, 1), distinct labels:
-    //   0.55: 28/11/17/1   1.10: 7/4/4/1   1.20: 3/2/2/1   1.25: 2/1/1/1
-    // Past ~1.15 real speakers start merging, and that is the worse error
-    // (two people under one label), so stay below the cliff.
     config.clustering = FastClusteringConfig {
         num_clusters: -1,
-        threshold: 1.10,
+        threshold: CLUSTERING_THRESHOLD,
     };
     OfflineSpeakerDiarization::create(&config)
+}
+
+/// Speaker-embedding extractor for the second-pass merge, using the same
+/// model the diarizer clusters with.
+fn create_embedding_extractor(
+    paths: &model_store::PipelineModelPaths,
+) -> Option<SpeakerEmbeddingExtractor> {
+    SpeakerEmbeddingExtractor::create(&SpeakerEmbeddingExtractorConfig {
+        model: Some(paths.embedding.to_string_lossy().to_string()),
+        num_threads: recommended_threads().min(8),
+        debug: false,
+        provider: Some("cpu".to_string()),
+    })
 }
 
 /// Run speaker diarization on a helper thread so the caller can keep the
@@ -758,17 +788,27 @@ fn detect_speakers(
     let (tx, rx) = std::sync::mpsc::channel();
     let worker_diarizer = Arc::clone(&diarizer);
     let worker_release = release.clone();
+    let worker_paths = paths.clone();
     let spawned = std::thread::Builder::new()
         .name("speaker-diarization".to_string())
         .spawn(move || {
             let segments = worker_diarizer.process(&owned).map(|result| {
-                result
+                let spans: Vec<speaker_merge::Span> = result
                     .sort_by_start_time()
                     .into_iter()
-                    .map(|segment| SpeakerSegment {
-                        start_secs: segment.start,
-                        end_secs: segment.end,
-                        speaker: segment.speaker.max(0) as u32,
+                    .map(|segment| speaker_merge::Span {
+                        start: segment.start,
+                        end: segment.end,
+                        speaker: segment.speaker,
+                    })
+                    .collect();
+                let spans = merge_speakers(&owned, &worker_paths, spans);
+                spans
+                    .into_iter()
+                    .map(|span| SpeakerSegment {
+                        start_secs: span.start,
+                        end_secs: span.end,
+                        speaker: span.speaker.max(0) as u32,
                     })
                     .collect::<Vec<_>>()
             });
@@ -806,6 +846,36 @@ fn detect_speakers(
             Err(RecvTimeoutError::Disconnected) => return None,
         }
     }
+}
+
+/// Second pass: merge clusters whose voice prints match (see speaker_merge).
+/// Falls back to the diarizer's own labels if the embedding model will not
+/// load, so a merge problem can never cost the transcript its speakers.
+fn merge_speakers(
+    samples: &[f32],
+    paths: &model_store::PipelineModelPaths,
+    spans: Vec<speaker_merge::Span>,
+) -> Vec<speaker_merge::Span> {
+    let Some(extractor) = create_embedding_extractor(paths) else {
+        crate::login_log::warn("speaker merge skipped: embedding model did not load");
+        return spans;
+    };
+    let before = distinct_speakers(&spans);
+    let prints = speaker_merge::voice_prints(&extractor, samples, SAMPLE_RATE as i32, &spans);
+    let merged = speaker_merge::merge_similar(&spans, &prints, SPEAKER_MERGE_SIMILARITY);
+    let merged = speaker_merge::fold_minor_speakers(&merged, MIN_SPEAKER_SECS);
+    crate::login_log::info(&format!(
+        "speaker merge: {before} clusters -> {} speakers",
+        distinct_speakers(&merged)
+    ));
+    merged
+}
+
+fn distinct_speakers(spans: &[speaker_merge::Span]) -> usize {
+    let mut labels: Vec<i32> = spans.iter().map(|s| s.speaker).collect();
+    labels.sort_unstable();
+    labels.dedup();
+    labels.len()
 }
 
 fn speaker_for_range(start: f32, end: f32, speakers: &[SpeakerSegment]) -> Option<u32> {
@@ -1077,11 +1147,18 @@ mod tests {
                 };
                 let diarizer = OfflineSpeakerDiarization::create(&config).unwrap();
                 let result = diarizer.process(slice).unwrap();
-                let sorted: Vec<i32> = result
-                    .sort_by_start_time()
-                    .into_iter()
-                    .map(|s| s.speaker)
+                let segments = result.sort_by_start_time();
+                let mut talk: std::collections::BTreeMap<i32, f32> = Default::default();
+                for segment in &segments {
+                    *talk.entry(segment.speaker).or_default() += segment.end - segment.start;
+                }
+                let mut talk: Vec<(i32, f32)> = talk.into_iter().collect();
+                talk.sort_by(|a, b| b.1.total_cmp(&a.1));
+                let talk_line: Vec<String> = talk
+                    .iter()
+                    .map(|(s, secs)| format!("{s}:{secs:.0}s"))
                     .collect();
+                let sorted: Vec<i32> = segments.iter().map(|s| s.speaker).collect();
                 let mut speakers = sorted.clone();
                 speakers.sort_unstable();
                 speakers.dedup();
@@ -1090,6 +1167,219 @@ mod tests {
                     result.num_speakers(),
                     sorted.len(),
                     speakers.len()
+                );
+                println!("    talk time: {}", talk_line.join(" "));
+            }
+        }
+    }
+
+    /// Manual accuracy eval against hand-confirmed speakers (ignored by
+    /// default). Reads a JSON manifest of cases ({case, audio, start, end}),
+    /// diarizes each window at every threshold in PLAUD_DIAR_BENCH_THRESHOLDS,
+    /// optionally applies the voice-print merge (PLAUD_DIAR_MERGE_THRESHOLDS),
+    /// and writes predictions to PLAUD_DIAR_EVAL_OUT for scoring elsewhere.
+    #[test]
+    #[ignore]
+    fn diar_eval() {
+        let manifest: Vec<serde_json::Value> = serde_json::from_str(
+            &fs::read_to_string(std::env::var("PLAUD_DIAR_EVAL_MANIFEST").unwrap()).unwrap(),
+        )
+        .unwrap();
+        let out_path = std::env::var("PLAUD_DIAR_EVAL_OUT").unwrap();
+        let models = std::env::var("PLAUD_DIAR_BENCH_MODELS").unwrap();
+        let parse = |var: &str, default: &str| -> Vec<f32> {
+            std::env::var(var)
+                .unwrap_or_else(|_| default.to_string())
+                .split(',')
+                .filter_map(|t| t.trim().parse().ok())
+                .collect()
+        };
+        let thresholds = parse("PLAUD_DIAR_BENCH_THRESHOLDS", "0.55,0.85,1.10");
+        let merges = parse("PLAUD_DIAR_MERGE_THRESHOLDS", "");
+        let paths = model_store::PipelineModelPaths {
+            vad: Path::new(&models).join("silero_vad.int8.onnx"),
+            segmentation: Path::new(&models).join("segmentation.int8.onnx"),
+            embedding: Path::new(&models).join("embedding.onnx"),
+        };
+        let extractor = create_embedding_extractor(&paths).unwrap();
+        let mut results = Vec::new();
+        for case in &manifest {
+            let name = case["case"].as_str().unwrap();
+            let start = case["start"].as_f64().unwrap() as f32;
+            let end = case["end"].as_f64().unwrap() as f32;
+            let all =
+                audio::decode_to_16khz_mono(Path::new(case["audio"].as_str().unwrap())).unwrap();
+            let from = ((start * SAMPLE_RATE as f32) as usize).min(all.len());
+            let to = ((end * SAMPLE_RATE as f32) as usize).min(all.len());
+            let slice = &all[from..to];
+            for &threshold in &thresholds {
+                let mut config = OfflineSpeakerDiarizationConfig::default();
+                config.segmentation = OfflineSpeakerSegmentationModelConfig {
+                    pyannote: OfflineSpeakerSegmentationPyannoteModelConfig {
+                        model: Some(paths.segmentation.to_string_lossy().to_string()),
+                    },
+                    num_threads: 8,
+                    debug: false,
+                    provider: Some("cpu".to_string()),
+                };
+                config.embedding.model = Some(paths.embedding.to_string_lossy().to_string());
+                config.embedding.num_threads = 8;
+                config.embedding.provider = Some("cpu".to_string());
+                config.clustering = FastClusteringConfig {
+                    num_clusters: -1,
+                    threshold,
+                };
+                let diarizer = OfflineSpeakerDiarization::create(&config).unwrap();
+                let spans: Vec<speaker_merge::Span> = diarizer
+                    .process(slice)
+                    .unwrap()
+                    .sort_by_start_time()
+                    .into_iter()
+                    .map(|s| speaker_merge::Span {
+                        start: s.start,
+                        end: s.end,
+                        speaker: s.speaker,
+                    })
+                    .collect();
+                let to_json = |spans: &[speaker_merge::Span]| -> Vec<serde_json::Value> {
+                    spans
+                        .iter()
+                        .map(|s| {
+                            serde_json::json!({
+                                "start": s.start + start,
+                                "end": s.end + start,
+                                "speaker_id": s.speaker.to_string(),
+                            })
+                        })
+                        .collect()
+                };
+                results.push(serde_json::json!({
+                    "case": name, "variant": format!("t{threshold:.2}"), "segments": to_json(&spans),
+                }));
+                if !merges.is_empty() {
+                    let prints =
+                        speaker_merge::voice_prints(&extractor, slice, SAMPLE_RATE as i32, &spans);
+                    for &merge in &merges {
+                        let merged = speaker_merge::merge_similar(&spans, &prints, merge);
+                        let merged = speaker_merge::fold_minor_speakers(&merged, MIN_SPEAKER_SECS);
+                        results.push(serde_json::json!({
+                            "case": name,
+                            "variant": format!("t{threshold:.2}+m{merge:.2}"),
+                            "segments": to_json(&merged),
+                        }));
+                    }
+                }
+                println!("{name} t={threshold:.2} done");
+            }
+            fs::write(&out_path, serde_json::to_string(&results).unwrap()).unwrap();
+        }
+    }
+
+    /// Manual check of the second-pass speaker merge (ignored by default).
+    /// Diarizes at the production threshold, prints each cluster's talk time
+    /// and the cosine similarity between cluster voice prints, then the
+    /// speaker count after merging at several thresholds.
+    /// Same env vars as diar_threshold_sweep, plus
+    /// [PLAUD_DIAR_MERGE_THRESHOLDS=0.5,0.6,0.7].
+    #[test]
+    #[ignore]
+    fn diar_merge_sweep() {
+        let audios: Vec<String> = std::env::var("PLAUD_DIAR_BENCH_AUDIO")
+            .unwrap()
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let models = std::env::var("PLAUD_DIAR_BENCH_MODELS").unwrap();
+        let max_secs: usize = std::env::var("PLAUD_DIAR_BENCH_MAX_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(600);
+        let merge_thresholds: Vec<f32> = std::env::var("PLAUD_DIAR_MERGE_THRESHOLDS")
+            .unwrap_or_else(|_| "0.4,0.5,0.6,0.7,0.8".to_string())
+            .split(',')
+            .filter_map(|t| t.trim().parse().ok())
+            .collect();
+        let paths = model_store::PipelineModelPaths {
+            vad: Path::new(&models).join("silero_vad.int8.onnx"),
+            segmentation: Path::new(&models).join("segmentation.int8.onnx"),
+            embedding: Path::new(&models).join("embedding.onnx"),
+        };
+        let diarizer = create_diarizer(&paths).unwrap();
+        let extractor = create_embedding_extractor(&paths).unwrap();
+        for audio in &audios {
+            let all = audio::decode_to_16khz_mono(Path::new(audio)).unwrap();
+            let n = (max_secs * SAMPLE_RATE as usize).min(all.len());
+            let slice = &all[..n];
+            let spans: Vec<speaker_merge::Span> = diarizer
+                .process(slice)
+                .unwrap()
+                .sort_by_start_time()
+                .into_iter()
+                .map(|s| speaker_merge::Span {
+                    start: s.start,
+                    end: s.end,
+                    speaker: s.speaker,
+                })
+                .collect();
+            let prints = speaker_merge::voice_prints(&extractor, slice, SAMPLE_RATE as i32, &spans);
+            if let Ok(dir) = std::env::var("PLAUD_DIAR_DUMP_DIR") {
+                let name = Path::new(audio)
+                    .file_stem()
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string();
+                let rows: Vec<String> = spans
+                    .iter()
+                    .map(|s| format!("{:.2}\t{:.2}\t{}", s.start, s.end, s.speaker))
+                    .collect();
+                fs::write(Path::new(&dir).join(format!("{name}.tsv")), rows.join("\n")).unwrap();
+            }
+            let mut talk: std::collections::BTreeMap<i32, f32> = Default::default();
+            for span in &spans {
+                *talk.entry(span.speaker).or_default() += span.end - span.start;
+            }
+            println!(
+                "== {} ({}s)",
+                Path::new(audio).file_name().unwrap().to_string_lossy(),
+                n / SAMPLE_RATE as usize
+            );
+            println!(
+                "   talk: {}",
+                talk.iter()
+                    .map(|(s, t)| format!(
+                        "{s}:{t:.0}s{}",
+                        if prints.contains_key(s) {
+                            ""
+                        } else {
+                            "(no print)"
+                        }
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            let labels: Vec<i32> = prints.keys().copied().collect();
+            for &a in &labels {
+                let row: Vec<String> = labels
+                    .iter()
+                    .map(|&b| format!("{:5.2}", speaker_merge::cosine(&prints[&a], &prints[&b])))
+                    .collect();
+                println!("   {a:>3}: {}", row.join(" "));
+            }
+            for &threshold in &merge_thresholds {
+                let merged = speaker_merge::merge_similar(&spans, &prints, threshold);
+                let merged = speaker_merge::fold_minor_speakers(&merged, MIN_SPEAKER_SECS);
+                let mut talk: std::collections::BTreeMap<i32, f32> = Default::default();
+                for span in &merged {
+                    *talk.entry(span.speaker).or_default() += span.end - span.start;
+                }
+                println!(
+                    "   merge>={threshold:.2}: speakers={} [{}]",
+                    talk.len(),
+                    talk.values()
+                        .map(|t| format!("{t:.0}s"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
                 );
             }
         }
