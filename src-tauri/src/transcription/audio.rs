@@ -14,6 +14,7 @@ use symphonia::core::io::MediaSourceStream;
 pub fn decode_to_16khz_mono(path: &Path) -> Result<Vec<f32>, String> {
     let (mut format, mut decoder, track_id, channels, sample_rate) = open_audio(path)?;
     let mut samples = Vec::new();
+    let mut skipped = 0usize;
 
     loop {
         let packet = match format.next_packet() {
@@ -31,10 +32,24 @@ pub fn decode_to_16khz_mono(path: &Path) -> Result<Vec<f32>, String> {
         if packet.track_id != track_id {
             continue;
         }
-        let decoded = decoder
-            .decode(&packet)
-            .map_err(|error| format!("Audio decode failed: {error}"))?;
+        // A corrupt frame (an MP3 "header missing", say) costs a few
+        // milliseconds of audio; failing here threw away the whole recording.
+        // Skip it, as ffmpeg does.
+        let decoded = match decoder.decode(&packet) {
+            Ok(decoded) => decoded,
+            Err(symphonia::core::errors::Error::DecodeError(_)) => {
+                skipped += 1;
+                continue;
+            }
+            Err(error) => return Err(format!("Audio decode failed: {error}")),
+        };
         samples.extend(decode_to_mono_f32(&decoded, channels));
+    }
+    if skipped > 0 {
+        crate::login_log::warn(&format!(
+            "skipped {skipped} undecodable audio packet(s) in {}",
+            path.display()
+        ));
     }
 
     if samples.is_empty() {
