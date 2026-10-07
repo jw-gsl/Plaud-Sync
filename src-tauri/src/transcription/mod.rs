@@ -721,10 +721,12 @@ fn obtain_diarizer(
 /// speakers: share of speech given to the wrong person, and average extra
 /// speakers. Tuned on 18 meetings, then checked on 12 held-out ones:
 ///
-///                                 tuning          held out
-///   0.55 alone (<= v0.5.0)        31.7%  +20.9    -
-///   1.10 alone (v0.6.0)           15.8%   +1.9    10.4%  +1.5
-///   0.85 + merge 0.70 + fold 8s   11.2%   -0.1     6.4%  -0.1
+/// ```text
+///                               tuning          held out
+/// 0.55 alone (<= v0.5.0)        31.7%  +20.9    -
+/// 1.10 alone (v0.6.0)           15.8%   +1.9    10.4%  +1.5
+/// 0.85 + merge 0.70 + fold 8s   11.2%   -0.1     6.4%  -0.1
+/// ```
 ///
 /// 1.10 alone looked best on speaker *count*, but it merged different people
 /// in 2 of 7 meetings with 4+ speakers (30% and 37% wrong). Clustering
