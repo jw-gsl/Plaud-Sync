@@ -3,6 +3,8 @@ export interface AuthStatus {
   email?: string;
   region?: string;
   name?: string;
+  /** Auto-sync found the session expired; syncing has stopped until sign-in. */
+  needsSignIn: boolean;
 }
 
 export interface Recording {
@@ -78,6 +80,14 @@ export interface LocalTranscriptResult {
   usedVad: boolean;
   usedDiarization: boolean;
   speakerCount: number;
+}
+
+/** A recording's failed local transcriptions (see commands::auto_retry_due). */
+export interface TranscribeFailure {
+  attempts: number;
+  lastError: string;
+  /** Unix seconds of the latest failed attempt. */
+  lastAttempt: number;
 }
 
 export interface LocalTranscriptionProgress {

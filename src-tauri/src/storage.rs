@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -21,6 +22,16 @@ fn cache_lock() -> std::sync::MutexGuard<'static, ()> {
 const SERVICE_NAME: &str = "com.jameswhiting.plaud-sync";
 const PASSWORD_ACCOUNT: &str = "plaud-password";
 const REFRESH_TOKEN_ACCOUNT: &str = "plaud-refresh-token";
+
+/// One recording's history of failed local transcriptions.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscribeFailure {
+    pub attempts: u32,
+    pub last_error: String,
+    /// Unix seconds of the most recent failed attempt.
+    pub last_attempt: i64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -344,6 +355,61 @@ impl Storage {
         self.get_recordings_cache().into_iter().find(|r| r.id == id)
     }
 
+    fn transcribe_failures_path(&self) -> PathBuf {
+        self.config_path.with_file_name("transcribe-failures.json")
+    }
+
+    /// Failed local transcriptions by recording id. A recording that fails is
+    /// retried with backoff rather than on every auto-sync tick.
+    pub fn get_transcribe_failures(&self) -> HashMap<String, TranscribeFailure> {
+        let _lock = cache_lock();
+        self.read_transcribe_failures()
+    }
+
+    fn read_transcribe_failures(&self) -> HashMap<String, TranscribeFailure> {
+        fs::read_to_string(self.transcribe_failures_path())
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or_default()
+    }
+
+    fn write_transcribe_failures(
+        &self,
+        failures: &HashMap<String, TranscribeFailure>,
+    ) -> Result<(), std::io::Error> {
+        let raw = serde_json::to_vec_pretty(failures)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        fs::write(self.transcribe_failures_path(), raw)
+    }
+
+    /// Count one more failed attempt for `id`, keeping the latest error.
+    pub fn record_transcribe_failure(
+        &self,
+        id: &str,
+        error: &str,
+        now_epoch: i64,
+    ) -> Result<TranscribeFailure, std::io::Error> {
+        let _lock = cache_lock();
+        let mut failures = self.read_transcribe_failures();
+        let entry = failures.entry(id.to_string()).or_default();
+        entry.attempts += 1;
+        entry.last_error = error.to_string();
+        entry.last_attempt = now_epoch;
+        let recorded = entry.clone();
+        self.write_transcribe_failures(&failures)?;
+        Ok(recorded)
+    }
+
+    /// Forget past failures for `id` (it transcribed, or the user retried it).
+    pub fn clear_transcribe_failure(&self, id: &str) -> Result<(), std::io::Error> {
+        let _lock = cache_lock();
+        let mut failures = self.read_transcribe_failures();
+        if failures.remove(id).is_some() {
+            self.write_transcribe_failures(&failures)?;
+        }
+        Ok(())
+    }
+
     pub fn get_settings(&self) -> AppSettings {
         self.load().settings.unwrap_or_default()
     }
@@ -407,6 +473,27 @@ fn default_download_dir() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transcribe_failures_count_up_and_clear() {
+        let dir = std::env::temp_dir().join("plaud-sync-failures-test");
+        let _ = fs::remove_dir_all(&dir);
+        let storage = Storage::new(dir).unwrap();
+
+        storage.record_transcribe_failure("a", "first", 10).unwrap();
+        let second = storage
+            .record_transcribe_failure("a", "second", 20)
+            .unwrap();
+        assert_eq!(second.attempts, 2);
+        assert_eq!(second.last_error, "second");
+        assert_eq!(second.last_attempt, 20);
+
+        storage.record_transcribe_failure("b", "other", 30).unwrap();
+        storage.clear_transcribe_failure("a").unwrap();
+        let left = storage.get_transcribe_failures();
+        assert!(!left.contains_key("a"));
+        assert_eq!(left["b"].attempts, 1);
+    }
 
     #[test]
     fn app_settings_deserializes_from_empty_object() {

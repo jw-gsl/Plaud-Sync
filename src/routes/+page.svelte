@@ -15,6 +15,7 @@
   } from "$lib/updater";
   import { onMount } from "svelte";
   import { getVersion } from "@tauri-apps/api/app";
+  import { listen } from "@tauri-apps/api/event";
 
   let auth = $state<AuthStatus | null>(null);
   let view = $state<"sync" | "settings">("sync");
@@ -38,6 +39,14 @@
     }
     auth = await api.getAuthStatus();
     loading = false;
+    // Auto-sync flags an expired session from the background; show it here
+    // even if the window was opened long after it happened.
+    void listen<string>("auth-required", () => {
+      if (auth) auth = { ...auth, needsSignIn: true };
+    });
+    void listen("auth-restored", () => {
+      if (auth) auth = { ...auth, needsSignIn: false };
+    });
     // Silent check on launch — surfaces a banner only if an update exists.
     void checkUpdates(false);
   });
@@ -145,6 +154,13 @@
     <div class="update-bar">
       <span>You're on the latest version.</span>
       <button class="link-button" onclick={() => (update = { kind: "idle" })}>Dismiss</button>
+    </div>
+  {/if}
+
+  {#if auth?.loggedIn && auth.needsSignIn}
+    <div class="update-bar error">
+      <span>Your Plaud sign-in has expired. New recordings won't download or transcribe until you sign in again.</span>
+      <button class="btn btn-primary btn-sm" onclick={handleLogout}>Sign in again</button>
     </div>
   {/if}
 

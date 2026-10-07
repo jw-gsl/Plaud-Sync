@@ -41,6 +41,13 @@ pub enum BrowserLogin {
 }
 
 impl AppState {
+    /// A sign-in just succeeded: drop the "sign in again" state and sync now.
+    pub fn signed_in(&self) {
+        self.needs_sign_in
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.sync_wake.notify_one();
+    }
+
     /// The recording currently being transcribed, if any.
     pub fn transcribing_id(&self) -> Option<String> {
         self.transcribing_id
@@ -100,6 +107,13 @@ pub struct AppState {
     /// not be renamed until the run finishes: the run writes its output
     /// against the audio path it captured at the start.
     pub transcribing_id: Mutex<Option<String>>,
+    /// Set once auto-sync has seen the session is no longer valid (expired,
+    /// refresh token gone, or repeated 401s); cleared on the next successful
+    /// sync or sign-in. Drives the in-app banner and the one-off notification.
+    pub needs_sign_in: AtomicBool,
+    /// Wakes the auto-sync loop early, e.g. right after a sign-in, instead of
+    /// waiting out a failure backoff that can be up to an hour long.
+    pub sync_wake: tokio::sync::Notify,
     pub local_model_download_running: AtomicBool,
     pub local_model_download_cancelled: AtomicBool,
 }
@@ -126,6 +140,8 @@ mod tests {
             local_transcription_running: AtomicBool::new(false),
             local_transcription_cancelled: Arc::new(AtomicBool::new(false)),
             transcribing_id: Mutex::new(None),
+            needs_sign_in: AtomicBool::new(false),
+            sync_wake: tokio::sync::Notify::new(),
             local_model_download_running: AtomicBool::new(false),
             local_model_download_cancelled: AtomicBool::new(false),
         };
