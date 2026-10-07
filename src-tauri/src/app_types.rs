@@ -5,4 +5,6 @@ pub struct AuthStatus {
     pub email: Option<String>,
     pub region: Option<String>,
     pub name: Option<String>,
+    /// Auto-sync found the session expired; the user must sign in again.
+    pub needs_sign_in: bool,
 }

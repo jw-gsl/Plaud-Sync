@@ -300,14 +300,25 @@ pub fn transcribe_file(
         })
         .collect::<Vec<_>>();
     let text = collapse_repetitions(&render_transcript(&speaker_segments, used_diarization));
+    // No speech is a result, not a failure. Treating it as an error left the
+    // recording untranscribed, so every auto-sync tick reloaded the model and
+    // tried again: two 15-second silent clips failed 499 times each.
     if text.is_empty() {
-        return Err(format!("{} returned an empty transcript", spec.name));
+        crate::login_log::info(&format!(
+            "no speech detected in {} ({duration:.0}s); saving an empty transcript",
+            audio_path.display()
+        ));
     }
+    let readable = if text.is_empty() {
+        NO_SPEECH_TEXT
+    } else {
+        text.as_str()
+    };
 
     progress(94, "Saving transcript…");
     let transcript_path = audio_path.with_extension("local.txt");
     let metadata_path = audio_path.with_extension("local.json");
-    atomic_write(&transcript_path, format!("{text}\n").as_bytes())?;
+    atomic_write(&transcript_path, format!("{readable}\n").as_bytes())?;
     let metadata = TranscriptMetadata {
         schema_version: 2,
         source_recording_id: recording_id.to_string(),
@@ -338,6 +349,10 @@ pub fn transcribe_file(
         speaker_count,
     })
 }
+
+/// What the .local.txt says for a recording with no speech in it. The
+/// .local.json keeps `text` empty, so tools can tell it apart from speech.
+pub const NO_SPEECH_TEXT: &str = "[No speech detected]";
 
 fn fallback_ranges(sample_count: usize, max_chunk_samples: usize) -> Vec<(usize, usize)> {
     (0..sample_count)

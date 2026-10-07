@@ -8,6 +8,7 @@ import type {
   Recording,
   SyncInfo,
   SyncResult,
+  TranscribeFailure,
 } from "./types";
 
 export const api = {
@@ -58,6 +59,7 @@ export const api = {
     invoke<string>("read_local_transcript", { recording }),
   deleteLocalRecording: (recording: Recording) =>
     invoke<void>("delete_local_recording", { recording }),
+  getTranscribeFailures: () => invoke<Record<string, TranscribeFailure>>("get_transcribe_failures"),
   renameRecording: (recording: Recording, newName: string) =>
     invoke<Recording>("rename_recording", { recording, newName }),
 };

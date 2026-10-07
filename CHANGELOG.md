@@ -7,6 +7,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The app updates itself from the rolling `plaud-sync-latest` GitHub release; the
 notes for each published version are taken from this file.
 
+## [0.6.2] - 2026-10-07
+
+### Fixed
+- Recordings with no speech in them are saved as transcribed ("No speech
+  detected") instead of failing and being retried on every sync.
+- A recording whose transcription fails is retried after an hour, then after
+  six hours, and then left alone. Its row shows "Will retry" or "Failed"
+  (hover for the reason), and a Retry button runs it again on demand.
+
+### Added
+- If your Plaud sign-in expires, the app now tells you: a banner with
+  "Sign in again", and one system notification. Previously syncing (and so
+  transcription) stopped silently. Signing in resumes syncing straight away.
+
 ## [0.6.1] - 2026-10-07
 
 ### Fixed

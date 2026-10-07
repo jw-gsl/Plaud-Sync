@@ -10,6 +10,7 @@
     Recording,
     SyncInfo,
     SyncProgress,
+    TranscribeFailure,
     SyncResult,
   } from "../types";
   import type { UpdateStatus } from "../updater";
@@ -54,6 +55,10 @@
   let queueCancel = false;
   let localTranscribing = $state<string | null>(null);
   let localProgress = $state<LocalTranscriptionProgress | null>(null);
+  // Failed local transcriptions by recording id. Auto-transcribe gives up after
+  // MAX_AUTO_ATTEMPTS; the row then says Failed and offers Retry.
+  let failures = $state<Record<string, TranscribeFailure>>({});
+  const MAX_AUTO_ATTEMPTS = 3;
   // Inline rename: id of the row being edited, its draft text, and a busy flag
   // for the in-flight API write.
   let renamingId = $state<string | null>(null);
@@ -205,6 +210,7 @@
     try {
       recordings = await api.listRecordings();
       lastSynced = Date.now();
+      failures = await api.getTranscribeFailures().catch(() => failures);
       status = recordings.length
         ? `${pendingCount} new · ${downloadedCount} downloaded`
         : "No recordings found in your account yet.";
@@ -457,8 +463,9 @@
         stage: "Starting local transcription…",
       };
       const result = await api.transcribeRecording(recording);
-      status = `Local transcript saved for ${recording.filename}`;
-      if (result.text) await refreshList();
+      status = result.text
+        ? `Local transcript saved for ${recording.filename}`
+        : `No speech detected in ${recording.filename}`;
     } catch (e) {
       const message = String(e);
       if (message.toLowerCase().includes("cancel")) {
@@ -469,6 +476,9 @@
     } finally {
       localTranscribing = null;
       localProgress = null;
+      // Always: a no-speech result has empty text but is still a transcript,
+      // and a failure changes the row to Failed / Will retry.
+      await refreshList();
     }
   }
 
@@ -806,13 +816,23 @@
             <span class="rec-meta">
               {formatDate(recording.startTime)} · {formatDuration(recording.duration)}{#if recording.isTrans}{" · TXT"}{/if}{#if recording.localTranscript}{" · Local TXT"}{/if}
             </span>
-            <span class="rec-state done">
+            <span
+              class="rec-state done"
+              class:failed={!recording.localTranscript && failures[recording.id]}
+              title={!recording.localTranscript && failures[recording.id]
+                ? `Transcription failed ${failures[recording.id].attempts}×: ${failures[recording.id].lastError}`
+                : undefined}
+            >
               {#if localTranscribing === recording.id}
                 Transcribing…
               {:else if queue.some((q) => q.id === recording.id)}
                 Queued
               {:else if recording.localTranscript}
                 Transcribed
+              {:else if failures[recording.id]?.attempts >= MAX_AUTO_ATTEMPTS}
+                Failed
+              {:else if failures[recording.id]}
+                Will retry
               {:else}
                 Saved
               {/if}
@@ -875,9 +895,11 @@
                   void transcribe(recording);
                 }}
                 disabled={localTranscribing !== null || queue.length > 0}
-                title="Transcribe with the local Parakeet model"
+                title={failures[recording.id]
+                  ? "Try transcribing this recording again"
+                  : "Transcribe with the local model"}
               >
-                Transcribe
+                {failures[recording.id] ? "Retry" : "Transcribe"}
               </button>
             {/if}
             {#if localTranscribing !== recording.id}
@@ -1187,6 +1209,9 @@
   }
   .rec-state.done {
     color: var(--success);
+  }
+  .rec-state.failed {
+    color: var(--danger);
   }
   .rec-state.new {
     color: var(--primary);

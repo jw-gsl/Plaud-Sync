@@ -22,6 +22,7 @@ pub fn run() {
         // relaunch the frontend calls after an update is applied.
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             None,
@@ -48,6 +49,8 @@ pub fn run() {
                     std::sync::atomic::AtomicBool::new(false),
                 ),
                 transcribing_id: std::sync::Mutex::new(None),
+                needs_sign_in: std::sync::atomic::AtomicBool::new(false),
+                sync_wake: tokio::sync::Notify::new(),
                 local_model_download_running: std::sync::atomic::AtomicBool::new(false),
                 local_model_download_cancelled: std::sync::atomic::AtomicBool::new(false),
             });
@@ -108,6 +111,7 @@ pub fn run() {
             commands::read_local_transcript,
             commands::delete_local_recording,
             commands::rename_recording,
+            commands::get_transcribe_failures,
             commands::log_client_error,
         ])
         .run(tauri::generate_context!())

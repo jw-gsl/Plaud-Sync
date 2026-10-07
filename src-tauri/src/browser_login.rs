@@ -629,6 +629,7 @@ async fn complete_session_cookie(
         },
         region: Some(region.to_string()),
         name: storage.get_display_name(),
+        needs_sign_in: false,
     })
 }
 
@@ -680,6 +681,7 @@ async fn complete_sso(
         },
         region: Some(region),
         name: storage.get_display_name(),
+        needs_sign_in: false,
     }))
 }
 
@@ -749,6 +751,7 @@ async fn complete_browser_auth(
         },
         region: Some(region.to_string()),
         name: storage.get_display_name(),
+        needs_sign_in: false,
     })
 }
 

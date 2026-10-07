@@ -279,7 +279,17 @@ pub async fn auto_sync_loop(app: AppHandle) {
     let mut consecutive_failures = 0u32;
     loop {
         let wait = failure_backoff_secs(consecutive_failures);
-        tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+        // A sign-in wakes the loop early: after repeated auth failures the
+        // backoff is an hour, and the user should not wait that long to see
+        // a fresh session work.
+        let state = app.state::<AppState>();
+        let woken = tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(wait)) => false,
+            _ = state.sync_wake.notified() => true,
+        };
+        if woken {
+            consecutive_failures = 0;
+        }
 
         let (storage, settings, logged_in) = {
             let state = app.state::<AppState>();
@@ -326,6 +336,13 @@ pub async fn auto_sync_loop(app: AppHandle) {
         };
         match pass {
             Ok(result) => {
+                if app
+                    .state::<AppState>()
+                    .needs_sign_in
+                    .swap(false, Ordering::AcqRel)
+                {
+                    let _ = app.emit("auth-restored", ());
+                }
                 if consecutive_failures > 0 {
                     crate::login_log::info("auto-sync recovered after earlier failures");
                 }
@@ -367,9 +384,50 @@ pub async fn auto_sync_loop(app: AppHandle) {
                         "auto-sync still failing ({consecutive_failures} in a row, next retry in {next_in}s): {e}"
                     ));
                 }
+                if is_auth_failure(&e, consecutive_failures) {
+                    flag_sign_in_needed(&app, &e);
+                }
                 let _ = app.emit("auto-sync-error", e);
             }
         }
+    }
+}
+
+/// Whether a failed auto-sync means the user has to sign in again. A missing
+/// refresh token is definitive; a bare 401 has to repeat first, so one
+/// transient rejection does not raise an alarm.
+fn is_auth_failure(error: &str, consecutive_failures: u32) -> bool {
+    let error = error.to_lowercase();
+    if error.contains("sign in again") || error.contains("no refresh token") {
+        return true;
+    }
+    (error.contains("401") || error.contains("unauthorized")) && consecutive_failures >= 2
+}
+
+/// Tell the user, once, that syncing has stopped until they sign in. Before
+/// this the app logged ~17,000 auth failures over months with nothing shown
+/// unless its window happened to be open -- and no sync means no new
+/// recordings and no transcriptions.
+fn flag_sign_in_needed(app: &AppHandle, error: &str) {
+    use std::sync::atomic::Ordering;
+    if app
+        .state::<AppState>()
+        .needs_sign_in
+        .swap(true, Ordering::AcqRel)
+    {
+        return; // already flagged; notify once, not on every retry
+    }
+    crate::login_log::error(&format!("sign-in needed: {error}"));
+    let _ = app.emit("auth-required", error.to_string());
+    use tauri_plugin_notification::NotificationExt;
+    if let Err(e) = app
+        .notification()
+        .builder()
+        .title("Plaud Sync needs you to sign in")
+        .body("Your Plaud session has expired. New recordings won't download or transcribe until you sign in again.")
+        .show()
+    {
+        crate::login_log::warn(&format!("could not show sign-in notification: {e}"));
     }
 }
 
@@ -933,6 +991,28 @@ mod tests {
             filename_style: style.into(),
             ..AppSettings::default()
         }
+    }
+
+    #[test]
+    fn an_expired_session_needs_sign_in_at_once() {
+        assert!(is_auth_failure(
+            "Session expired and no refresh token is stored — please sign in again.",
+            1
+        ));
+    }
+
+    #[test]
+    fn a_401_needs_sign_in_only_once_it_repeats() {
+        assert!(!is_auth_failure("Plaud API error: 401 Unauthorized", 1));
+        assert!(is_auth_failure("Plaud API error: 401 Unauthorized", 2));
+    }
+
+    #[test]
+    fn a_network_error_is_not_a_sign_in_problem() {
+        assert!(!is_auth_failure(
+            "Network error: error sending request for url (https://api.plaud.ai/file/simple/web)",
+            10
+        ));
     }
 
     #[test]

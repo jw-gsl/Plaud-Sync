@@ -38,6 +38,9 @@ pub async fn get_auth_status(state: State<'_, AppState>) -> Result<AuthStatus, S
         email: creds.as_ref().map(|c| c.email.clone()),
         region: creds.map(|c| c.region),
         name,
+        needs_sign_in: state
+            .needs_sign_in
+            .load(std::sync::atomic::Ordering::Acquire),
     })
 }
 
@@ -66,11 +69,13 @@ pub async fn login_with_email(
     }
 
     let creds = storage.get_credentials();
+    state.signed_in();
     Ok(AuthStatus {
         logged_in: true,
         email: creds.as_ref().map(|c| c.email.clone()),
         region: Some(region),
         name: storage.get_display_name(),
+        needs_sign_in: false,
     })
 }
 
@@ -79,7 +84,9 @@ pub async fn login_with_browser(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<AuthStatus, String> {
-    browser_login::login_with_browser(&app, DEFAULT_REGION, state).await
+    let status = browser_login::login_with_browser(&app, DEFAULT_REGION, state).await?;
+    app.state::<AppState>().signed_in();
+    Ok(status)
 }
 
 #[tauri::command]
@@ -105,11 +112,13 @@ pub async fn login_with_token(
                     let _ = storage.save_display_name(&user.nickname);
                 }
                 let creds = storage.get_credentials();
+                state.signed_in();
                 return Ok(AuthStatus {
                     logged_in: true,
                     email: creds.as_ref().map(|c| c.email.clone()),
                     region: Some(region.to_string()),
                     name: storage.get_display_name(),
+                    needs_sign_in: false,
                 });
             }
             Err(e) => last_err = e,
@@ -510,14 +519,61 @@ pub(crate) async fn transcribe_recording_inner(
                 transcript.used_diarization
             ));
             emit_progress(100, "Transcript saved");
+            if let Err(e) = storage.clear_transcribe_failure(&recording.id) {
+                crate::login_log::warn(&format!("could not clear failure record: {e}"));
+            }
         }
-        Err(e) => crate::login_log::warn(&format!(
-            "transcribe failed: \"{}\" after {}: {e}",
+        // A cancel is the user's choice, not a fault with the recording.
+        Err(e) if is_cancel(e) => crate::login_log::info(&format!(
+            "transcribe cancelled: \"{}\" after {}",
             recording.filename,
             format_elapsed(started.elapsed())
         )),
+        Err(e) => {
+            let attempts = storage
+                .record_transcribe_failure(&recording.id, e, crate::state::now_epoch())
+                .map(|f| f.attempts)
+                .unwrap_or(0);
+            crate::login_log::warn(&format!(
+                "transcribe failed (attempt {attempts}): \"{}\" after {}: {e}",
+                recording.filename,
+                format_elapsed(started.elapsed())
+            ));
+        }
     }
     result
+}
+
+fn is_cancel(error: &str) -> bool {
+    error.to_lowercase().contains("cancel")
+}
+
+/// Auto-transcribe gives a failing recording this many tries in total.
+const MAX_AUTO_TRANSCRIBE_ATTEMPTS: u32 = 3;
+
+/// Whether auto-transcribe should try a recording with this failure history
+/// again now: 1 hour after the first failure, 6 hours after the second, then
+/// never (the row shows Failed and a manual Retry still works).
+///
+/// Before this every failure was retried on every auto-sync tick, forever:
+/// two silent clips were each re-run 499 times.
+fn auto_retry_due(failure: &crate::storage::TranscribeFailure, now_epoch: i64) -> bool {
+    let wait_secs = match failure.attempts {
+        0 => 0,
+        1 => 60 * 60,
+        2 => 6 * 60 * 60,
+        _ => return false,
+    };
+    failure.attempts < MAX_AUTO_TRANSCRIBE_ATTEMPTS && now_epoch >= failure.last_attempt + wait_secs
+}
+
+/// Failed local transcriptions by recording id, for the recordings list.
+#[tauri::command]
+pub fn get_transcribe_failures(
+    state: State<'_, AppState>,
+) -> Result<std::collections::HashMap<String, crate::storage::TranscribeFailure>, String> {
+    let storage = state.storage.lock().map_err(|e| e.to_string())?.clone();
+    Ok(storage.get_transcribe_failures())
 }
 
 /// Ask a running local transcription to stop. The blocking worker polls the
@@ -580,6 +636,17 @@ pub(crate) async fn auto_transcribe_new(app: &AppHandle) -> usize {
             downloaded && !transcribed
         })
         .collect();
+    // Hold back recordings that failed recently or too often.
+    let failures = storage.get_transcribe_failures();
+    let now = crate::state::now_epoch();
+    let before = pending.len();
+    pending.retain(|r| failures.get(&r.id).is_none_or(|f| auto_retry_due(f, now)));
+    if pending.len() < before {
+        crate::login_log::debug(&format!(
+            "auto-transcribe: holding back {} recording(s) after earlier failures",
+            before - pending.len()
+        ));
+    }
     let now_ms = crate::state::now_epoch() * 1000;
     order_transcribe_queue(&mut pending, now_ms);
     if pending.is_empty() {
@@ -651,7 +718,7 @@ pub(crate) async fn auto_transcribe_new(app: &AppHandle) -> usize {
         match transcribe_recording_inner(app, recording).await {
             Ok(_) => transcribed += 1,
             // A user cancel stops the whole auto pass (don't march on to the next).
-            Err(e) if e.to_lowercase().contains("cancel") => break,
+            Err(e) if is_cancel(&e) => break,
             Err(e) => crate::login_log::warn(&format!(
                 "auto-transcribe failed for \"{}\": {e}",
                 recording.filename
@@ -1162,6 +1229,32 @@ fn reveal_in_file_manager(path: &std::path::Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::plaud::types::PlaudRecording;
+    use crate::storage::TranscribeFailure;
+
+    fn failed(attempts: u32, last_attempt: i64) -> TranscribeFailure {
+        TranscribeFailure {
+            attempts,
+            last_error: "boom".into(),
+            last_attempt,
+        }
+    }
+
+    #[test]
+    fn a_failed_recording_waits_an_hour_then_six_then_stops() {
+        let t = 1_000_000;
+        assert!(!auto_retry_due(&failed(1, t), t + 59 * 60));
+        assert!(auto_retry_due(&failed(1, t), t + 60 * 60));
+        assert!(!auto_retry_due(&failed(2, t), t + 5 * 60 * 60));
+        assert!(auto_retry_due(&failed(2, t), t + 6 * 60 * 60));
+        // Third failure: auto-transcribe gives up for good.
+        assert!(!auto_retry_due(&failed(3, t), t + 365 * 24 * 60 * 60));
+    }
+
+    #[test]
+    fn a_cancel_is_not_counted_as_a_failure() {
+        assert!(is_cancel("Transcription cancelled"));
+        assert!(!is_cancel("Audio decode failed: bad header"));
+    }
 
     fn at(start_time: i64) -> PlaudRecording {
         PlaudRecording {
