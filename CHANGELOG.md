@@ -7,6 +7,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 The app updates itself from the rolling `plaud-sync-latest` GitHub release; the
 notes for each published version are taken from this file.
 
+## [0.6.1] - 2026-10-07
+
+### Fixed
+- Speaker labels are much more accurate. Measured against meetings with
+  hand-confirmed speakers, far less speech is credited to the wrong person,
+  and the number of speakers now matches the meeting on average. 0.6.0 could
+  put two different people under one label in meetings of four or more.
+- Two recordings with the same title on the same day no longer share one set
+  of files. Previously the second was never downloaded, showed the first
+  one's transcript, and deleting either deleted both.
+- A single corrupt frame in a recording no longer makes its whole
+  transcription fail; the bad frame is skipped.
+
 ## [0.6.0] - 2026-10-01
 
 ### Added

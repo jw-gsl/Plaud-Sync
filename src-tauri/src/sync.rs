@@ -375,17 +375,84 @@ pub async fn auto_sync_loop(app: AppHandle) {
 
 pub fn mark_downloaded_status(recordings: &mut [PlaudRecording], settings: &AppSettings) {
     let root = PathBuf::from(&settings.download_dir);
+    // Backfill basenames for libraries downloaded before the field existed,
+    // without letting two same-titled recordings both adopt one set of files.
+    assign_local_bases(&root, settings, recordings, &[]);
     for rec in recordings.iter_mut() {
         let base = resolve_local_base(&root, rec, settings);
         rec.downloaded = local_audio(&base).is_some();
-        // Backfill the id-keyed basename for libraries downloaded before this
-        // field existed, so the next cloud-side rename can't strand the files.
-        if rec.downloaded && rec.local_basename.is_none() {
-            rec.local_basename = base
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string());
+    }
+}
+
+/// Give every recording a local base no *other* recording owns.
+///
+/// Two recordings with the same title on the same day derive the same
+/// title-based path. Before this, the second one found the first one's audio
+/// there, counted as "already on disk", was never downloaded, and adopted the
+/// same basename -- so deleting either deleted both sets of files.
+///
+/// Owners are, in order: a basename already persisted (in `known`, the cache,
+/// or on the recording itself); then a recording whose title path holds files,
+/// first in listing order (for libraries from before basenames were stored,
+/// which one owned the files was never recorded, so this is the best guess).
+/// Any remaining recording whose title path is owned by another id gets an id
+/// suffix, which is where it will then be downloaded.
+///
+/// A basename is only set on a recording that owns files or needed a suffix;
+/// a plain not-yet-downloaded one keeps resolving by title, so a later
+/// filename-style change still applies to it.
+pub fn assign_local_bases(
+    root: &Path,
+    settings: &AppSettings,
+    recordings: &mut [PlaudRecording],
+    known: &[PlaudRecording],
+) {
+    let mut owner: std::collections::HashMap<PathBuf, String> = std::collections::HashMap::new();
+    for rec in known.iter().chain(recordings.iter()) {
+        if let Some(basename) = &rec.local_basename {
+            owner
+                .entry(audio_dir(root, rec, settings).join(basename))
+                .or_insert_with(|| rec.id.clone());
         }
     }
+    let title_base =
+        |rec: &PlaudRecording| build_audio_path(root, rec, settings).with_extension("");
+    let name_of = |path: &Path| path.file_name().map(|n| n.to_string_lossy().to_string());
+
+    // Pass 1: recordings whose title path already holds files claim it.
+    for rec in recordings.iter_mut().filter(|r| r.local_basename.is_none()) {
+        let base = title_base(rec);
+        let has_files = local_file_variants(&base).iter().any(|p| p.is_file());
+        if has_files && !owner.contains_key(&base) {
+            owner.insert(base.clone(), rec.id.clone());
+            rec.local_basename = name_of(&base);
+        }
+    }
+    // Pass 2: everyone else gets the title path if free, otherwise a suffix.
+    for rec in recordings.iter_mut().filter(|r| r.local_basename.is_none()) {
+        let base = title_base(rec);
+        match owner.get(&base) {
+            Some(id) if id != &rec.id => {
+                let suffixed = base.with_file_name(format!(
+                    "{}-{}",
+                    name_of(&base).unwrap_or_default(),
+                    id_fragment(&rec.id)
+                ));
+                owner.insert(suffixed.clone(), rec.id.clone());
+                rec.local_basename = name_of(&suffixed);
+            }
+            _ => {
+                owner.insert(base, rec.id.clone());
+            }
+        }
+    }
+}
+
+/// Short, stable tail of a recording id used to keep same-titled recordings'
+/// files apart.
+fn id_fragment(id: &str) -> String {
+    let chars: Vec<char> = id.chars().collect();
+    chars[chars.len().saturating_sub(6)..].iter().collect()
 }
 
 pub fn mark_local_transcript_status(recordings: &mut [PlaudRecording], settings: &AppSettings) {
@@ -511,6 +578,25 @@ pub fn reconcile_listing(
             entry.local_basename = recording.local_basename.clone();
             changed = true;
         }
+        // Same-title collisions, now that every rename has settled. Persist
+        // only basenames that point at real files; a suffix for a recording
+        // not downloaded yet is recomputed identically on each listing.
+        let before: Vec<Option<String>> =
+            recordings.iter().map(|r| r.local_basename.clone()).collect();
+        assign_local_bases(&root, settings, recordings, cached);
+        for (recording, previous) in recordings.iter().zip(before) {
+            if recording.local_basename == previous {
+                continue;
+            }
+            let base = resolve_local_base(&root, recording, settings);
+            if !local_file_variants(&base).iter().any(|p| p.is_file()) {
+                continue;
+            }
+            if let Some(entry) = cached.iter_mut().find(|c| c.id == recording.id) {
+                entry.local_basename = recording.local_basename.clone();
+                changed = true;
+            }
+        }
         (renamed, changed)
     });
     outcome.unwrap_or_else(|e| {
@@ -563,16 +649,7 @@ pub fn apply_local_rename(
                 .any(|path| path.exists())
     };
     if taken(&final_name) {
-        let fragment: String = recording
-            .id
-            .chars()
-            .rev()
-            .take(6)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        final_name = format!("{new_name}-{fragment}");
+        final_name = format!("{new_name}-{}", id_fragment(&recording.id));
         if taken(&final_name) {
             return Err(format!(
                 "Cannot rename: \"{final_name}\" already exists on disk."
@@ -1181,6 +1258,85 @@ mod local_rename_tests {
             local_basename: None,
             ..rec(filename)
         }
+    }
+
+    /// Two recordings, same title, same day. The second must not adopt the
+    /// first one's files (it was skipped as "already on disk" and then shared
+    /// its basename, so deleting either deleted both).
+    #[test]
+    fn a_same_titled_newcomer_gets_its_own_base() {
+        let root = scratch("same-title-newcomer");
+        let settings = settings(&root);
+        let mut first = rec("Weekly Sync");
+        seed_files(&root, &settings, &first);
+        first.local_basename = Some("Weekly-Sync".into());
+        let second = PlaudRecording {
+            id: "ffffff0123".into(),
+            local_basename: None,
+            ..rec("Weekly Sync")
+        };
+
+        let mut listing = vec![second.clone()];
+        assign_local_bases(&root, &settings, &mut listing, &[first.clone()]);
+        assert_eq!(
+            listing[0].local_basename.as_deref(),
+            Some("Weekly-Sync-ff0123")
+        );
+        let base = resolve_local_base(&root, &listing[0], &settings);
+        assert!(local_audio(&base).is_none(), "second is not downloaded yet");
+        assert_ne!(base, resolve_local_base(&root, &first, &settings));
+    }
+
+    /// Two same-titled recordings new in one listing: distinct bases, so the
+    /// second download is not skipped as "already on disk" after the first.
+    #[test]
+    fn two_new_same_titled_recordings_get_distinct_bases() {
+        let root = scratch("same-title-both-new");
+        let settings = settings(&root);
+        let a = PlaudRecording {
+            local_basename: None,
+            ..rec("Weekly Sync")
+        };
+        let b = PlaudRecording {
+            id: "ffffff0123".into(),
+            local_basename: None,
+            ..rec("Weekly Sync")
+        };
+        let mut listing = vec![a, b];
+        assign_local_bases(&root, &settings, &mut listing, &[]);
+        let bases: Vec<PathBuf> = listing
+            .iter()
+            .map(|r| resolve_local_base(&root, r, &settings))
+            .collect();
+        assert_ne!(bases[0], bases[1]);
+        // The first keeps resolving by title, so a style change still applies.
+        assert_eq!(listing[0].local_basename, None);
+    }
+
+    /// A library from before basenames were stored: files exist once, both
+    /// recordings claim the title path. Only one may own it.
+    #[test]
+    fn legacy_same_titled_pair_shares_nothing() {
+        let root = scratch("same-title-legacy");
+        let settings = settings(&root);
+        let a = PlaudRecording {
+            local_basename: None,
+            ..rec("Weekly Sync")
+        };
+        seed_files(&root, &settings, &a);
+        let b = PlaudRecording {
+            id: "ffffff0123".into(),
+            local_basename: None,
+            ..rec("Weekly Sync")
+        };
+        let mut listing = vec![a, b];
+        mark_downloaded_status(&mut listing, &settings);
+        assert!(listing[0].downloaded);
+        assert!(
+            !listing[1].downloaded,
+            "the second must not count as downloaded"
+        );
+        assert_ne!(listing[0].local_basename, listing[1].local_basename);
     }
 
     /// Review finding C2: the mirror moved the files but the loop kept

@@ -708,6 +708,30 @@ pub fn delete_local_recording(
     let storage = state.storage.lock().map_err(|e| e.to_string())?;
     let settings = storage.get_settings();
     let root = std::path::PathBuf::from(&settings.download_dir);
+    // Delete is the one destructive path, so resolve from the cache rather
+    // than the caller's copy, and never by a title path another recording
+    // owns (two same-titled recordings must not delete each other's files).
+    let mut recording = recording;
+    let cached = storage.get_recordings_cache();
+    if let Some(basename) = cached
+        .iter()
+        .find(|c| c.id == recording.id)
+        .and_then(|c| c.local_basename.clone())
+    {
+        recording.local_basename = Some(basename);
+    }
+    if recording.local_basename.is_none() {
+        let others: Vec<PlaudRecording> = cached
+            .into_iter()
+            .filter(|c| c.id != recording.id)
+            .collect();
+        crate::sync::assign_local_bases(
+            &root,
+            &settings,
+            std::slice::from_mut(&mut recording),
+            &others,
+        );
+    }
     let base = crate::sync::resolve_local_base(&root, &recording, &settings);
     let mut removed = 0usize;
     // Remove every file a download or local transcription may have produced.
